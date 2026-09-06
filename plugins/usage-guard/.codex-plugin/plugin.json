@@ -1,0 +1,23 @@
+{
+  "name": "usage-guard",
+  "version": "0.1.0+codex.20260906044420",
+  "description": "Quota-aware lifecycle guardrails for long Codex tasks",
+  "author": {
+    "name": "Dream-Rainy"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Usage Guard",
+    "shortDescription": "Check usage and protect long-running Codex work.",
+    "longDescription": "Usage Guard checks Codex usage at lifecycle boundaries, narrows expensive work as limits approach, and preserves bounded checkpoint and reporting paths.",
+    "developerName": "Dream-Rainy",
+    "category": "Productivity",
+    "capabilities": [
+      "Automation"
+    ],
+    "defaultPrompt": [
+      "Show my current Usage Guard state.",
+      "Explain which operations Usage Guard currently allows."
+    ]
+  }
+}

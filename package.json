@@ -1,0 +1,20 @@
+{
+  "name": "usage-guard",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Git marketplace for the cross-platform Usage Guard Codex plugin",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Dream-Rainy/usage-guard.git"
+  },
+  "homepage": "https://github.com/Dream-Rainy/usage-guard#readme",
+  "bugs": "https://github.com/Dream-Rainy/usage-guard/issues",
+  "scripts": {
+    "test": "node --test plugins/usage-guard/tests/run-tests.js",
+    "check": "node --check plugins/usage-guard/scripts/usage-guard.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

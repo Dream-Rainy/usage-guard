@@ -1,0 +1,20 @@
+{
+  "name": "usage-guard",
+  "interface": {
+    "displayName": "Usage Guard"
+  },
+  "plugins": [
+    {
+      "name": "usage-guard",
+      "source": {
+        "source": "local",
+        "path": "./plugins/usage-guard"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

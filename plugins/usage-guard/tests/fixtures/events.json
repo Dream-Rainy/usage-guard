@@ -1,0 +1,74 @@
+{
+  "SessionStart": {
+    "session_id": "session-fixture",
+    "hook_event_name": "SessionStart",
+    "source": "startup",
+    "permission_mode": "default"
+  },
+  "UserPromptSubmit": {
+    "session_id": "session-fixture",
+    "turn_id": "turn-fixture",
+    "hook_event_name": "UserPromptSubmit",
+    "prompt": "Fix the bug",
+    "permission_mode": "default"
+  },
+  "PreToolUse": {
+    "session_id": "session-fixture",
+    "turn_id": "turn-fixture",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_use_id": "tool-fixture",
+    "tool_input": { "command": "git status --short" },
+    "permission_mode": "default"
+  },
+  "PostToolUse": {
+    "session_id": "session-fixture",
+    "turn_id": "turn-fixture",
+    "hook_event_name": "PostToolUse",
+    "tool_name": "mcp__codex_app__get_usage_limits",
+    "tool_use_id": "usage-fixture",
+    "tool_input": {},
+    "tool_response": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"rateLimits\":{\"primary\":{\"usedPercent\":10,\"windowDurationMins\":300,\"resetsAt\":2000000000},\"secondary\":{\"usedPercent\":20,\"windowDurationMins\":10080,\"resetsAt\":2000001000}}}"
+        }
+      ]
+    },
+    "permission_mode": "default"
+  },
+  "PreCompact": {
+    "session_id": "session-fixture",
+    "turn_id": "turn-fixture",
+    "hook_event_name": "PreCompact",
+    "trigger": "auto"
+  },
+  "PostCompact": {
+    "session_id": "session-fixture",
+    "turn_id": "turn-fixture",
+    "hook_event_name": "PostCompact",
+    "trigger": "auto"
+  },
+  "SubagentStart": {
+    "session_id": "session-fixture",
+    "turn_id": "turn-fixture",
+    "hook_event_name": "SubagentStart",
+    "agent_id": "agent-fixture",
+    "agent_type": "worker",
+    "permission_mode": "default"
+  },
+  "Stop": {
+    "session_id": "session-fixture",
+    "turn_id": "turn-fixture",
+    "hook_event_name": "Stop",
+    "stop_hook_active": false,
+    "last_assistant_message": "Done",
+    "permission_mode": "default"
+  },
+  "SessionEnd": {
+    "session_id": "session-fixture",
+    "hook_event_name": "SessionEnd",
+    "reason": "other"
+  }
+}
