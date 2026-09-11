@@ -279,8 +279,13 @@ function New-ResumePlan {
 }
 
 function Get-ResumePlanForState {
-    param($State, $Event, $PreviousPlan)
-    if ([string](Get-Value $State 'currentPolicy') -ne 'EMERGENCY' -or [bool](Get-Value $State 'stale')) {
+    param($State, $Event, $PreviousPlan, $Pause = $null)
+    $policy = [string](Get-Value $State 'currentPolicy')
+    $pauseCandidate = [bool](Get-Value $Pause 'pauseCandidate') -and
+        [bool](Get-Value $Pause 'checkpointObserved') -and
+        [string](Get-Value $Pause 'pauseReason') -eq 'usage_guard'
+    $pauseWindow = if ($pauseCandidate -and $policy -ne 'EMERGENCY') { [string](Get-Value $Pause 'pauseWindow') } else { '' }
+    if ((-not $pauseCandidate -and $policy -ne 'EMERGENCY') -or [bool](Get-Value $State 'stale')) {
         return [pscustomobject]@{ Plan = (New-ResumePlan); RequestCreated = $false }
     }
 
@@ -289,6 +294,19 @@ function Get-ResumePlanForState {
     $windows = Get-Value $State 'windows'
     foreach ($name in @('primary', 'secondary')) {
         $window = Get-Value $windows $name
+        if ($pauseWindow -and $name -eq $pauseWindow) {
+            [void]$blocking.Add($name)
+            $reset = ConvertTo-Number (Get-Value $Pause 'pauseResetAt')
+            if ($null -eq $reset) { $reset = ConvertTo-Number (Get-Value $window 'resetsAt') }
+            if ($null -eq $reset) {
+                return [pscustomobject]@{
+                    Plan = (New-ResumePlan -BlockingWindows @($blocking) -Status 'SKIPPED_INVALID_RESET')
+                    RequestCreated = $false
+                }
+            }
+            [void]$resetValues.Add([long][Math]::Floor($reset))
+            continue
+        }
         $remaining = ConvertTo-Number (Get-Value $window 'remainingPercent')
         if ($null -ne $remaining -and $remaining -lt 8) {
             [void]$blocking.Add($name)
@@ -344,6 +362,30 @@ function Get-ResumePlanForState {
     }
 }
 
+function Get-ResumeAutomationRrule {
+    param($WakeAt)
+    $unix = ConvertTo-Number $WakeAt
+    if ($null -eq $unix) { return $null }
+    try { $local = [DateTimeOffset]::FromUnixTimeSeconds([long]$unix).ToLocalTime() } catch { return $null }
+    return "RRULE:FREQ=DAILY;BYHOUR=$($local.Hour.ToString('00'));BYMINUTE=$($local.Minute.ToString('00'));BYSECOND=$($local.Second.ToString('00'));COUNT=1"
+}
+
+function Get-ResumeAutomationInput {
+    param($Plan)
+    $key = [string](Get-Value $Plan 'scheduleKey')
+    $rrule = Get-ResumeAutomationRrule (Get-Value $Plan 'wakeAt')
+    if ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($rrule)) { return $null }
+    return [ordered]@{
+        mode = 'create'
+        kind = 'heartbeat'
+        destination = 'thread'
+        name = 'Usage Guard resume'
+        prompt = "Usage Guard recovery scheduleKey=$key. Refresh Usage Guard when this heartbeat runs. Continue from the existing checkpoint only after usage leaves EMERGENCY, obey the current policy, stay quiet if still blocked, and pause this heartbeat after its recovery run."
+        rrule = $rrule
+        status = 'ACTIVE'
+    }
+}
+
 function Get-ResumePlanContext {
     param($State, [bool]$RequestCreated)
     $plan = Get-Value $State 'resumePlan'
@@ -365,7 +407,9 @@ function Get-ResumePlanContext {
         return " Auto-resume is already scheduled for wakeAt=$wakeIso scheduleKey=$key; do not create another heartbeat."
     }
     if ($RequestCreated) {
-        return " AUTO-RESUME ACTION: create exactly one same-thread heartbeat with $script:AutomationToolName for wakeAt=$wakeIso scheduleKey=$key. Name it 'Usage Guard resume'. Its prompt must refresh Usage Guard, continue from the existing checkpoint only after leaving EMERGENCY, obey the new policy, stay quiet if still blocked, and pause itself after its recovery run. If the tool is unavailable, report that once and stop after checkpointing."
+        $input = Get-ResumeAutomationInput $plan
+        $json = $input | ConvertTo-Json -Depth 10 -Compress
+        return " AUTO-RESUME ACTION: call $script:AutomationToolName exactly once with this direct create input (do not use suggested_create and do not include DTSTART): $json. If the tool is unavailable, report that once and stop after checkpointing."
     }
     return " Auto-resume was already requested for wakeAt=$wakeIso scheduleKey=$key; do not request a duplicate."
 }
@@ -525,8 +569,14 @@ function Get-ToolClassification {
         $checkpointSafe = $command -match '(?i)(docs[\\/]plan|task_plan\.md|progress\.md|findings\.md|checkpoint|state\.md)'
         return [pscustomobject]@{ Cost = 'MEDIUM'; CheckpointSafe = $checkpointSafe; Kind = 'edit' }
     }
-    if ($name -eq 'Bash' -or $lowerName -eq 'exec_command') {
-        if ($command -match '(?i)^\s*git\s+(status|diff)(\s|$)') { return [pscustomobject]@{ Cost = 'LOW'; CheckpointSafe = $true; Kind = 'status' } }
+    if ($name -eq 'Bash' -or $lowerName -in @('exec_command', 'exec', 'functions.exec')) {
+        $statusPattern = if ($lowerName -in @('exec', 'functions.exec')) { '(?i)\bgit\s+(status|diff)(\s|$)' } else { '(?i)^\s*git\s+(status|diff)(\s|$)' }
+        if ($command -match $statusPattern) { return [pscustomobject]@{ Cost = 'LOW'; CheckpointSafe = $true; Kind = 'status' } }
+        if ($lowerName -in @('exec', 'functions.exec') -and
+            $command -match '(?i)(?:apply_patch|tools\.apply_patch)' -and
+            $command -match '(?i)(docs[\\/]plan|task_plan\.md|progress\.md|findings\.md|checkpoint|state\.md)') {
+            return [pscustomobject]@{ Cost = 'MEDIUM'; CheckpointSafe = $true; Kind = 'edit' }
+        }
         if ($command -match '(?i)(--watch|--parallel|--all\b|\s-j\s*\d*|benchmark|dependency|\binstall\b|\brestore\b|\b(build|test)\b.*(--all|--parallel)|rg\s+--files|Get-ChildItem.*-Recurse)') {
             return [pscustomobject]@{ Cost = 'HIGH'; CheckpointSafe = $false; Kind = 'bulk-shell' }
         }
@@ -560,6 +610,13 @@ function New-TurnRecord {
         resumeScheduleAttempted = $false
         resumeContinuationRequested = $false
         resumeScheduleKey = $null
+        pauseCandidate = $false
+        pauseReason = $null
+        pausePolicy = $null
+        pauseCandidateAt = $null
+        checkpointObserved = $false
+        pauseWindow = $null
+        pauseResetAt = $null
     }
 }
 
@@ -582,7 +639,9 @@ function Update-UsageSnapshot {
     try {
         $previousPlan = Get-Value $state 'resumePlan'
         $state = Convert-UsageToState (Invoke-RateLimitQuery) $state
-        $resume = Get-ResumePlanForState $state $Event $previousPlan
+        $classification = Get-ToolClassification $Event
+        $pause = if ($classification.Kind -eq 'resume-automation' -and $Turn.pauseCandidate -and $Turn.checkpointObserved) { $Turn } else { $null }
+        $resume = Get-ResumePlanForState $state $Event $previousPlan $pause
         $state.resumePlan = $resume.Plan
         $Turn.usageChecked = $true
         $Turn.effectivePolicy = $state.currentPolicy
@@ -601,14 +660,68 @@ function Update-UsageSnapshot {
     }
 }
 
+function Update-PauseCandidate {
+    param($Turn, $State, $Classification, [string]$Policy)
+    if ($null -eq $Turn -or $Classification.Kind -eq 'resume-automation') { return $false }
+    $changed = $false
+    if ($Turn.pauseCandidate -and $Turn.checkpointObserved -and -not $Classification.CheckpointSafe) {
+        $Turn.pauseCandidate = $false
+        $Turn.pauseReason = $null
+        $Turn.pausePolicy = $null
+        $Turn.pauseCandidateAt = $null
+        $Turn.checkpointObserved = $false
+        $Turn.pauseWindow = $null
+        $Turn.pauseResetAt = $null
+        $changed = $true
+    }
+    if ($Policy -eq 'CRITICAL' -or $Policy -eq 'EMERGENCY') {
+        if (-not $Turn.pauseCandidate) {
+            $windows = Get-Value $State 'windows'
+            $reasonWindow = [string](Get-Value $State 'reasonWindow')
+            $candidateWindow = @('primary', 'secondary') | Where-Object { $_ -eq $reasonWindow -and $null -ne (Get-Value $windows $_) } | Select-Object -First 1
+            if (-not $candidateWindow) {
+                $candidateWindow = @('primary', 'secondary') | Where-Object {
+                    $remaining = ConvertTo-Number (Get-Value (Get-Value $windows $_) 'remainingPercent')
+                    $null -ne $remaining -and $remaining -lt 15
+                } | Select-Object -First 1
+            }
+            $Turn.pauseCandidate = $true
+            $Turn.pauseReason = 'usage_guard'
+            $Turn.pausePolicy = $Policy
+            $Turn.pauseCandidateAt = (Get-UtcNow).ToString('o')
+            $Turn.pauseWindow = if ($candidateWindow) { [string]$candidateWindow } else { $null }
+            $Turn.pauseResetAt = if ($candidateWindow) { ConvertTo-Number (Get-Value (Get-Value $windows $candidateWindow) 'resetsAt') } else { $null }
+            $changed = $true
+        }
+        if ($Classification.CheckpointSafe -and -not $Turn.checkpointObserved) {
+            $Turn.checkpointObserved = $true
+            $changed = $true
+        }
+    }
+    elseif ($Turn.pauseCandidate -and $Classification.CheckpointSafe -and -not $Turn.checkpointObserved) {
+        $Turn.checkpointObserved = $true
+        $changed = $true
+    }
+    return $changed
+}
+
 function Test-MatchingResumeAutomation {
     param($Event, $State)
     $plan = Get-Value $State 'resumePlan'
     if (-not [bool](Get-Value $plan 'eligible')) { return $false }
-    $key = [string](Get-Value $plan 'scheduleKey')
-    if ([string]::IsNullOrWhiteSpace($key)) { return $false }
-    $inputText = Get-ToolCommandText $Event
-    return $inputText.Contains($key, [StringComparison]::Ordinal) -and $inputText -match '(?i)usage[ -]guard'
+    $expected = Get-ResumeAutomationInput $plan
+    $input = Get-Value $Event 'tool_input'
+    if ($null -eq $expected -or $null -eq $input) { return $false }
+    $prompt = Get-Value $input 'prompt'
+    return (Get-Value $input 'mode') -eq $expected.mode -and
+        (Get-Value $input 'kind') -eq $expected.kind -and
+        (Get-Value $input 'destination') -eq $expected.destination -and
+        (Get-Value $input 'name') -eq $expected.name -and
+        (Get-Value $input 'rrule') -eq $expected.rrule -and
+        (Get-Value $input 'status') -eq $expected.status -and
+        $prompt -is [string] -and
+        $prompt.Contains([string](Get-Value $plan 'scheduleKey'), [StringComparison]::Ordinal) -and
+        $prompt -match '(?i)usage[ -]guard'
 }
 
 function Remove-ExpiredTurns {
@@ -625,18 +738,21 @@ function Invoke-PreToolPolicy {
     $classification = Get-ToolClassification $Event
     if ($classification.Kind -eq 'usage') { return @{} }
     $turn = Get-TurnRecord $Event
-    if ($null -ne $turn -and [bool](Get-Value $turn 'overrideOnce')) {
-        return New-ContextOutput 'PreToolUse' 'Usage Guard one-turn override is active. Continue deliberately; usage warnings still apply.'
-    }
-    if ($null -eq $turn -or (-not [bool](Get-Value $turn 'usageAttempted') -and -not [bool](Get-Value $turn 'usageChecked'))) {
-        $refresh = Update-UsageSnapshot $Event $turn
-        $turn = $refresh.Turn
-    }
-    $state = Get-State
+    if ($null -eq $turn) { $turn = New-TurnRecord $Event }
+    $override = [bool](Get-Value $turn 'overrideOnce')
+    $refresh = Update-UsageSnapshot $Event $turn
+    $turn = $refresh.Turn
+    $state = $refresh.State
     $policy = [string](Get-Value $state 'currentPolicy')
     if ([string]::IsNullOrWhiteSpace($policy)) { $policy = 'UNKNOWN' }
+    if ($override) {
+        return New-ContextOutput 'PreToolUse' "Usage Guard one-turn override is active. Continue deliberately; usage warnings still apply. $((Get-PolicySummary $state))"
+    }
+    if (Update-PauseCandidate $turn $state $classification $policy) { Save-TurnRecord $Event $turn }
     if ($classification.Kind -eq 'resume-automation') {
-        if ($policy -ne 'EMERGENCY') { return @{} }
+        $plan = Get-Value $state 'resumePlan'
+        $planned = [bool](Get-Value $plan 'eligible') -and [string](Get-Value $plan 'status') -in @('REQUESTED', 'SCHEDULED', 'FAILED')
+        if ($policy -ne 'EMERGENCY' -and -not $planned) { return @{} }
         if (-not (Test-MatchingResumeAutomation $Event $state)) {
             return New-DenyOutput 'Usage Guard EMERGENCY permits only the heartbeat matching the current recovery schedule key.'
         }
@@ -647,13 +763,6 @@ function Invoke-PreToolPolicy {
     }
     if ($policy -eq 'UNKNOWN') {
         return New-ContextOutput 'PreToolUse' 'Usage state is UNKNOWN; fail-open is active. Continue cautiously and preserve a checkpoint after repeated failures.' 'Usage Guard could not read quota and is failing open.'
-    }
-    if ($classification.Cost -eq 'HIGH' -and (Get-SnapshotAgeSeconds $state) -gt $script:FreshSeconds) {
-        $refresh = Update-UsageSnapshot $Event $turn
-        $state = $refresh.State
-        if (-not $refresh.Succeeded -and [string](Get-Value $state 'currentPolicy') -eq 'UNKNOWN') {
-            return New-ContextOutput 'PreToolUse' 'Usage refresh failed before high-cost work; fail-open is active. Continue cautiously and preserve a bounded checkpoint.' 'Usage Guard could not refresh quota and is failing open.'
-        }
     }
     switch ($policy) {
         'NORMAL' { return @{} }
@@ -792,7 +901,7 @@ function Invoke-HookEvent {
         'SessionStart' {
             Remove-ExpiredTurns
             $state = Get-State
-            return New-ContextOutput 'SessionStart' "Usage Guard is active and queries Codex usage automatically on each user turn. $((Get-PolicySummary $state))."
+            return New-ContextOutput 'SessionStart' "Usage Guard is active and queries Codex usage automatically on each user turn and before every tool call. $((Get-PolicySummary $state))."
         }
         'UserPromptSubmit' {
             $turn = New-TurnRecord $Event
@@ -823,18 +932,37 @@ function Invoke-HookEvent {
             $state = Get-State
             $plan = Get-Value $state 'resumePlan'
             $turn = Get-TurnRecord $Event
+            $requested = [bool](Get-Value $plan 'eligible') -and [string](Get-Value $plan 'status') -eq 'REQUESTED'
+            if (-not $requested -and $null -ne $turn -and [bool](Get-Value $turn 'pauseCandidate') -and [bool](Get-Value $turn 'checkpointObserved')) {
+                $resume = Get-ResumePlanForState $state $Event $plan $turn
+                $state.resumePlan = $resume.Plan
+                $plan = $resume.Plan
+                $requested = [bool](Get-Value $plan 'eligible') -and [string](Get-Value $plan 'status') -eq 'REQUESTED'
+                Write-JsonAtomic (Get-StatePath) $state
+            }
+            $wakeAtValue = ConvertTo-Number (Get-Value $plan 'wakeAt')
+            $nowUnix = (Get-UtcNow).ToUnixTimeSeconds()
+            if ($requested -and ($null -eq $wakeAtValue -or $wakeAtValue -le $nowUnix)) {
+                $plan.eligible = $false
+                $plan.status = 'SKIPPED_INVALID_RESET'
+                $plan.lastError = 'Recovery wake time expired before scheduling.'
+                $plan.updatedAt = (Get-UtcNow).ToString('o')
+                $state.resumePlan = $plan
+                Write-JsonAtomic (Get-StatePath) $state
+                return @{}
+            }
             if ($null -eq $turn) { return @{} }
-            $eligible = [bool](Get-Value $plan 'eligible')
-            $status = [string](Get-Value $plan 'status')
             $attempted = [bool](Get-Value $turn 'resumeScheduleAttempted')
             $continued = [bool](Get-Value $turn 'resumeContinuationRequested')
-            if ($eligible -and $status -eq 'REQUESTED' -and -not $attempted -and -not $continued) {
+            if ($requested -and -not $attempted -and -not $continued) {
                 $turn.resumeContinuationRequested = $true
                 Save-TurnRecord $Event $turn
-                $wakeAt = [long](ConvertTo-Number (Get-Value $plan 'wakeAt'))
+                $wakeAt = [long]$wakeAtValue
                 $wakeIso = [DateTimeOffset]::FromUnixTimeSeconds($wakeAt).ToString('o')
                 $key = [string](Get-Value $plan 'scheduleKey')
-                return [ordered]@{ decision = 'block'; reason = "Attempt the one Usage Guard same-thread heartbeat now with $script:AutomationToolName for wakeAt=$wakeIso scheduleKey=$key. If the tool is unavailable, report that once, preserve the checkpoint, and stop; do not retry." }
+                $input = Get-ResumeAutomationInput $plan
+                $json = $input | ConvertTo-Json -Depth 10 -Compress
+                return [ordered]@{ decision = 'block'; reason = "Attempt the one Usage Guard same-thread heartbeat now with $script:AutomationToolName using this direct create input (do not use suggested_create and do not include DTSTART): $json for wakeAt=$wakeIso scheduleKey=$key. If the tool is unavailable, report that once, preserve the checkpoint, and stop; do not retry." }
             }
             return @{}
         }

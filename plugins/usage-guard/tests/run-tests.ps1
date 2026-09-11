@@ -62,12 +62,21 @@ function New-Event {
 }
 
 $mockResponsePath = Join-Path $testRoot 'mock-rate-limits.json'
-Write-JsonAtomic $mockResponsePath ([ordered]@{
-    rateLimits = [ordered]@{
-        primary = [ordered]@{ usedPercent = 10; windowDurationMins = 300; resetsAt = 2000000000 }
-        secondary = [ordered]@{ usedPercent = 20; windowDurationMins = 10080; resetsAt = 2000001000 }
-    }
-})
+function Set-MockUsage {
+    param(
+        [double]$PrimaryUsed,
+        [double]$SecondaryUsed,
+        $PrimaryReset = 2000000000,
+        $SecondaryReset = 2000001000
+    )
+    Write-JsonAtomic $mockResponsePath ([ordered]@{
+        rateLimits = [ordered]@{
+            primary = [ordered]@{ usedPercent = $PrimaryUsed; windowDurationMins = 300; resetsAt = $PrimaryReset }
+            secondary = [ordered]@{ usedPercent = $SecondaryUsed; windowDurationMins = 10080; resetsAt = $SecondaryReset }
+        }
+    })
+}
+Set-MockUsage 10 20
 $env:USAGE_GUARD_TEST_RESPONSE_PATH = $mockResponsePath
 
 try {
@@ -114,8 +123,12 @@ try {
     Assert-True ($statusClass.Cost -eq 'LOW' -and $statusClass.CheckpointSafe) 'git status is bounded checkpoint safe'
     $scanClass = Get-ToolClassification (New-Event 'PreToolUse' 'Bash' 'rg --files')
     Assert-True ($scanClass.Cost -eq 'HIGH' -and -not $scanClass.CheckpointSafe) 'repository scan is not checkpoint safe'
+    $wrappedStatusClass = Get-ToolClassification (New-Event 'PreToolUse' 'exec' 'text(await tools.exec_command({cmd:"git status --short"}))')
+    Assert-True ($wrappedStatusClass.Cost -eq 'LOW' -and $wrappedStatusClass.CheckpointSafe) 'wrapped exec status is bounded checkpoint safe'
     $planEdit = Get-ToolClassification (New-Event 'PreToolUse' 'apply_patch' '*** Update File: docs/plan/progress.md')
     Assert-True ($planEdit.Cost -eq 'MEDIUM' -and $planEdit.CheckpointSafe) 'planning edit is checkpoint safe'
+    $wrappedPlanEdit = Get-ToolClassification (New-Event 'PreToolUse' 'exec' 'text(await tools.apply_patch("*** Update File: docs/plan/progress.md"))')
+    Assert-True ($wrappedPlanEdit.Cost -eq 'MEDIUM' -and $wrappedPlanEdit.CheckpointSafe) 'wrapped planning edit is checkpoint safe'
 
     $events = Get-Content -Raw -LiteralPath $fixturePath | ConvertFrom-Json -Depth 40
     foreach ($eventName in @('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact', 'SubagentStart', 'Stop', 'SessionEnd')) {
@@ -138,10 +151,11 @@ try {
     $record.usageChecked = $true
     $record.overrideOnce = $false
     Save-TurnRecord $turnEvent $record
+    $env:USAGE_GUARD_NOW_UTC = '2026-09-03T00:07:00Z'
     $before = (Get-State).lastSuccessfulAt
     $preResult = Invoke-PreToolPolicy (New-Event 'PreToolUse' 'Bash' 'git status --short')
     $after = (Get-State).lastSuccessfulAt
-    Assert-Equal $before $after 'ordinary PreToolUse does not query or mutate snapshot'
+    Assert-True ($before -cne $after) 'ordinary PreToolUse refreshes the usage snapshot'
 
     $stopTurn = New-Event 'UserPromptSubmit'
     $stopTurn.turn_id = 'stop-turn'
@@ -156,12 +170,31 @@ try {
 
     $emergency = Convert-UsageToState (New-UsageResponse 95 93) (New-DefaultState)
     Write-JsonAtomic (Get-StatePath) $emergency
+    Set-MockUsage 95 93
     $record.effectivePolicy = 'EMERGENCY'
     Save-TurnRecord $turnEvent $record
     $allowedCheckpoint = Invoke-PreToolPolicy (New-Event 'PreToolUse' 'Bash' 'git diff --stat')
     Assert-True ($null -eq $allowedCheckpoint.hookSpecificOutput.permissionDecision) 'emergency allows bounded checkpoint'
     $blockedScan = Invoke-PreToolPolicy (New-Event 'PreToolUse' 'Bash' 'rg --files')
     Assert-Equal 'deny' $blockedScan.hookSpecificOutput.permissionDecision 'emergency blocks repository scan'
+
+    $pauseNow = [DateTimeOffset]::Parse($env:USAGE_GUARD_NOW_UTC).ToUnixTimeSeconds()
+    $pauseReset = $pauseNow + 1800
+    Set-MockUsage 86 20 $pauseReset ($pauseNow + 50000)
+    $pauseEvent = New-Event 'PreToolUse' 'exec' 'text(await tools.apply_patch("*** Update File: docs/plan/progress.md"))'
+    $pauseEvent.turn_id = 'pause-turn'
+    $pauseContext = Invoke-PreToolPolicy $pauseEvent
+    Assert-True ($pauseContext.hookSpecificOutput.additionalContext -match 'CRITICAL') 'critical checkpoint warning is emitted'
+    $pauseRecord = Get-TurnRecord $pauseEvent
+    Assert-True ([bool]$pauseRecord.pauseCandidate -and $pauseRecord.pauseReason -eq 'usage_guard' -and [bool]$pauseRecord.checkpointObserved) 'critical checkpoint records a pause candidate'
+    $recovered = Convert-UsageToState (New-UsageResponse 10 20 $pauseReset ($pauseNow + 50000)) (Get-State)
+    Write-JsonAtomic (Get-StatePath) $recovered
+    $pauseStop = New-Event 'Stop'
+    $pauseStop.turn_id = 'pause-turn'
+    $pauseDecision = Invoke-HookEvent $pauseStop
+    Assert-Equal 'block' $pauseDecision.decision 'checkpoint pause requests one recovery heartbeat'
+    Assert-True ($pauseDecision.reason -match '"mode":"create"') 'checkpoint pause uses direct automation create'
+    Assert-Equal 'REQUESTED' (Get-State).resumePlan.status 'checkpoint pause persists requested plan'
 
     $env:USAGE_GUARD_NOW_UTC = '2026-09-03T00:00:00Z'
     $nowUnix = [DateTimeOffset]::Parse($env:USAGE_GUARD_NOW_UTC).ToUnixTimeSeconds()
@@ -202,20 +235,33 @@ try {
     Assert-True (-not [bool]$duplicate.RequestCreated) 'matching requested schedule key is deduplicated'
     Assert-Equal $exactPlanResult.Plan.scheduleKey $duplicate.Plan.scheduleKey 'deduplication preserves schedule key'
 
+    $resumeInput = Get-ResumeAutomationInput $exactPlanResult.Plan
+    Assert-Equal 'create' $resumeInput.mode 'resume automation uses direct create'
+    Assert-Equal 'heartbeat' $resumeInput.kind 'resume automation uses heartbeat kind'
+    Assert-Equal 'thread' $resumeInput.destination 'resume automation targets the same thread'
+    Assert-Equal 'Usage Guard resume' $resumeInput.name 'resume automation has stable name'
+    Assert-Equal 'ACTIVE' $resumeInput.status 'resume automation is active'
+    Assert-True ($resumeInput.rrule -match '^RRULE:FREQ=DAILY;BYHOUR=\d{2};BYMINUTE=\d{2};BYSECOND=\d{2};COUNT=1$') 'resume automation has a future one-shot RRULE'
+    Assert-True ($resumeInput.prompt.Contains([string]$exactPlanResult.Plan.scheduleKey, [StringComparison]::Ordinal)) 'resume prompt binds schedule key'
+    Assert-True ($null -eq (Get-ResumeAutomationRrule $null)) 'invalid wake time has no RRULE'
+
     $exactState.resumePlan = $exactPlanResult.Plan
     Write-JsonAtomic (Get-StatePath) $exactState
+    Set-MockUsage 95 20 $exactReset ($nowUnix + 50000)
     $autoTurn = New-TurnRecord $resumeEvent
     $autoTurn.usageAttempted = $true
     $autoTurn.usageChecked = $true
     Save-TurnRecord $resumeEvent $autoTurn
     $autoEvent = New-Event 'PreToolUse' $script:AutomationToolName
-    $autoEvent.tool_input = [pscustomobject]@{
-        name = 'Usage Guard resume'
-        prompt = "Usage Guard recovery scheduleKey=$($exactPlanResult.Plan.scheduleKey)"
-    }
+    $autoEvent.tool_input = [pscustomobject]$resumeInput
     $autoPre = Invoke-PreToolPolicy $autoEvent
     Assert-True ($null -eq $autoPre.hookSpecificOutput.permissionDecision) 'matching recovery automation allowed in emergency'
     Assert-True ([bool](Get-TurnRecord $autoEvent).resumeScheduleAttempted) 'automation attempt recorded before tool call'
+    $suggestedAuto = New-Event 'PreToolUse' $script:AutomationToolName
+    $suggestedAuto.tool_input = [pscustomobject]$resumeInput
+    $suggestedAuto.tool_input.mode = 'suggested_create'
+    $suggestedPre = Invoke-PreToolPolicy $suggestedAuto
+    Assert-Equal 'deny' $suggestedPre.hookSpecificOutput.permissionDecision 'suggested automation denied in emergency'
     $unrelatedAuto = New-Event 'PreToolUse' $script:AutomationToolName
     $unrelatedAuto.tool_input = [pscustomobject]@{ name = 'Other task'; prompt = 'Unrelated automation' }
     $unrelatedPre = Invoke-PreToolPolicy $unrelatedAuto
@@ -248,6 +294,39 @@ try {
     $null = Invoke-AutomationPostTool $genericIdPost
     Assert-Equal 'FAILED' (Get-State).resumePlan.status 'generic response id is not treated as scheduling success'
 
+    $expiredState = $exactState | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+    $expiredPlan = $exactPlanResult.Plan | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+    $expiredPlan.wakeAt = $nowUnix - 1
+    $expiredPlan.status = 'REQUESTED'
+    $expiredPlan.eligible = $true
+    $expiredState.resumePlan = $expiredPlan
+    Write-JsonAtomic (Get-StatePath) $expiredState
+    Set-MockUsage 95 20 ($nowUnix - 1) ($nowUnix + 50000)
+    $expiredStopEvent = New-Event 'Stop'
+    $expiredStopEvent.turn_id = 'expired-stop-turn'
+    $expiredStopTurn = New-TurnRecord $expiredStopEvent
+    $expiredStopTurn.usageAttempted = $true
+    $expiredStopTurn.usageChecked = $true
+    Save-TurnRecord $expiredStopEvent $expiredStopTurn
+    $expiredStopFirst = Invoke-HookEvent $expiredStopEvent
+    Assert-True ($null -eq $expiredStopFirst.decision) 'expired resume does not block Stop'
+    Assert-Equal 'SKIPPED_INVALID_RESET' (Get-State).resumePlan.status 'expired resume is invalidated'
+    Assert-True (-not [bool](Get-State).resumePlan.eligible) 'expired resume is no longer eligible'
+    $expiredStopSecond = Invoke-HookEvent $expiredStopEvent
+    Assert-True ($null -eq $expiredStopSecond.decision) 'expired resume is not retried'
+    $expiredAutomation = New-Event 'PreToolUse' $script:AutomationToolName
+    $expiredAutomation.turn_id = 'expired-automation-turn'
+    $expiredAutomation.tool_input = [pscustomobject]@{
+        name = 'Usage Guard resume'
+        prompt = "Usage Guard recovery scheduleKey=$($exactPlanResult.Plan.scheduleKey)"
+    }
+    $expiredAutomationTurn = New-TurnRecord $expiredAutomation
+    $expiredAutomationTurn.usageAttempted = $true
+    $expiredAutomationTurn.usageChecked = $true
+    Save-TurnRecord $expiredAutomation $expiredAutomationTurn
+    $expiredAutomationPre = Invoke-PreToolPolicy $expiredAutomation
+    Assert-Equal 'deny' $expiredAutomationPre.hookSpecificOutput.permissionDecision 'expired heartbeat is denied'
+
     $exactState.resumePlan = $exactPlanResult.Plan
     Write-JsonAtomic (Get-StatePath) $exactState
     $stopResumeEvent = New-Event 'Stop'
@@ -257,6 +336,9 @@ try {
     Save-TurnRecord $stopResumeEvent $stopResumeTurn
     $resumeStopFirst = Invoke-HookEvent $stopResumeEvent
     Assert-Equal 'block' $resumeStopFirst.decision 'eligible unattempted resume gets one Stop continuation'
+    Assert-True ($resumeStopFirst.reason -match '"mode":"create"') 'Stop continuation includes direct create mode'
+    Assert-True ($resumeStopFirst.reason -match '"destination":"thread"') 'Stop continuation includes same-thread destination'
+    Assert-True ($resumeStopFirst.reason -match '"rrule":"RRULE:FREQ=DAILY;') 'Stop continuation includes one-shot RRULE'
     $resumeStopSecond = Invoke-HookEvent $stopResumeEvent
     Assert-True ($null -eq $resumeStopSecond.decision) 'resume Stop continuation is not repeated'
     $stopResumeEvent.stop_hook_active = $true

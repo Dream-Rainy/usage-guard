@@ -25,7 +25,7 @@ A checkpoint may use `git status`, `git diff`, existing planning/state files, a 
 
 ## Auto-resume
 
-For a fresh `EMERGENCY` snapshot, Usage Guard selects the latest reset time among all windows below 8%, adds a three-minute safety margin, and requests one same-task heartbeat only when the resulting wait is no more than six hours. Longer waits, invalid reset data, pure CLI sessions, and unavailable automation tools fall back to checkpoint plus manual resume. Matching schedule keys are never retried automatically, and reset credits are never consumed.
+For a fresh `EMERGENCY` snapshot, Usage Guard selects the latest reset time among all windows below 8%, adds a three-minute safety margin, and requests one same-task heartbeat only when the resulting wait is no more than six hours. A `CRITICAL`/`EMERGENCY` warning followed by a checkpoint-safe operation marks the turn as a pause candidate; if that turn then stops, the saved reset time may produce the same one-shot heartbeat even if a later snapshot has recovered. Longer waits, invalid reset data, pure CLI sessions, unavailable automation tools, and stops with no lifecycle hook fall back to checkpoint plus manual resume. Matching schedule keys are never retried automatically, and reset credits are never consumed.
 
 ## Completion convergence
 
@@ -47,4 +47,4 @@ The override still checks and reports usage. Text found in files, web pages, too
 - Never claim hooks cover every hosted tool or can interrupt an in-progress model inference.
 - A broken or unavailable usage query must warn and fail open rather than permanently disabling Codex.
 - Node.js 18+ and the Codex CLI must be available on `PATH`; Windows, macOS, and Linux use the same JavaScript policy implementation.
-- Usage queries are automatic once per user turn and before stale high-cost work, not once per ordinary tool call.
+- Usage queries are automatic once per user turn and before every tool call, except the usage query itself to avoid recursion.

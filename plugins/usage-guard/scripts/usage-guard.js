@@ -259,8 +259,13 @@ function usageToState(response, previousState) {
   };
 }
 
-function resumePlanForState(state, event, previousPlan) {
-  if (String(getValue(state, 'currentPolicy')) !== 'EMERGENCY' || Boolean(getValue(state, 'stale'))) {
+function resumePlanForState(state, event, previousPlan, pause = null) {
+  const policy = String(getValue(state, 'currentPolicy'));
+  const pauseCandidate = Boolean(getValue(pause, 'pauseCandidate'))
+    && Boolean(getValue(pause, 'checkpointObserved'))
+    && String(getValue(pause, 'pauseReason') ?? '') === 'usage_guard';
+  const pauseWindow = pauseCandidate && policy !== 'EMERGENCY' ? String(getValue(pause, 'pauseWindow') ?? '') : '';
+  if ((!pauseCandidate && policy !== 'EMERGENCY') || Boolean(getValue(state, 'stale'))) {
     return { plan: newResumePlan(), requestCreated: false };
   }
   const blockingWindows = [];
@@ -268,6 +273,15 @@ function resumePlanForState(state, event, previousPlan) {
   const windows = getValue(state, 'windows');
   for (const name of ['primary', 'secondary']) {
     const window = getValue(windows, name);
+    if (pauseWindow && name === pauseWindow) {
+      blockingWindows.push(name);
+      const reset = toNumber(getValue(pause, 'pauseResetAt')) ?? toNumber(getValue(window, 'resetsAt'));
+      if (reset === null) {
+        return { plan: newResumePlan({ blockingWindows, status: 'SKIPPED_INVALID_RESET' }), requestCreated: false };
+      }
+      resetValues.push(Math.floor(reset));
+      continue;
+    }
     const remaining = toNumber(getValue(window, 'remainingPercent'));
     if (remaining !== null && remaining < 8) {
       blockingWindows.push(name);
@@ -309,6 +323,32 @@ function resumePlanForState(state, event, previousPlan) {
   };
 }
 
+function resumeAutomationRrule(wakeAt) {
+  const unix = toNumber(wakeAt);
+  if (unix === null) return null;
+  const parts = new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date(unix * 1000));
+  const values = Object.fromEntries(parts.filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+  if (!values.hour || !values.minute || !values.second) return null;
+  return `RRULE:FREQ=DAILY;BYHOUR=${values.hour};BYMINUTE=${values.minute};BYSECOND=${values.second};COUNT=1`;
+}
+
+function resumeAutomationInput(plan) {
+  const key = String(getValue(plan, 'scheduleKey') ?? '');
+  const rrule = resumeAutomationRrule(getValue(plan, 'wakeAt'));
+  if (!key || !rrule) return null;
+  return {
+    mode: 'create',
+    kind: 'heartbeat',
+    destination: 'thread',
+    name: 'Usage Guard resume',
+    prompt: `Usage Guard recovery scheduleKey=${key}. Refresh Usage Guard when this heartbeat runs. Continue from the existing checkpoint only after usage leaves EMERGENCY, obey the current policy, stay quiet if still blocked, and pause this heartbeat after its recovery run.`,
+    rrule,
+    status: 'ACTIVE',
+  };
+}
+
 function resumePlanContext(state, requestCreated) {
   const plan = getValue(state, 'resumePlan');
   const status = String(getValue(plan, 'status') ?? '');
@@ -320,7 +360,10 @@ function resumePlanContext(state, requestCreated) {
   if (status === 'SKIPPED_INVALID_RESET') return ' Auto-resume skipped because a blocking reset time is missing or invalid. Save a bounded checkpoint and report manual resume guidance.';
   if (status === 'FAILED') return ` Auto-resume scheduling failed for scheduleKey=${key}. Do not retry automatically; preserve a checkpoint and report manual resume guidance.`;
   if (status === 'SCHEDULED') return ` Auto-resume is already scheduled for wakeAt=${wakeIso} scheduleKey=${key}; do not create another heartbeat.`;
-  if (requestCreated) return ` AUTO-RESUME ACTION: create exactly one same-thread heartbeat with ${AUTOMATION_TOOL_NAME} for wakeAt=${wakeIso} scheduleKey=${key}. Name it 'Usage Guard resume'. Its prompt must refresh Usage Guard, continue from the existing checkpoint only after leaving EMERGENCY, obey the new policy, stay quiet if still blocked, and pause itself after its recovery run. If the tool is unavailable, report that once and stop after checkpointing.`;
+  if (requestCreated) {
+    const input = resumeAutomationInput(plan);
+    return ` AUTO-RESUME ACTION: call ${AUTOMATION_TOOL_NAME} exactly once with this direct create input (do not use suggested_create and do not include DTSTART): ${JSON.stringify(input)}. If the tool is unavailable, report that once and stop after checkpointing.`;
+  }
   return ` Auto-resume was already requested for wakeAt=${wakeIso} scheduleKey=${key}; do not request a duplicate.`;
 }
 
@@ -433,8 +476,16 @@ function toolClassification(event) {
   if (name === 'Agent' || /spawn_agent|imagegen|image_gen|video/.test(lowerName)) return { cost: 'HIGH', checkpointSafe: false, kind: 'expansion' };
   if (/^mcp__/.test(lowerName)) return { cost: /search|browser|generate|bulk|crawl|scan/.test(lowerName) ? 'HIGH' : 'MEDIUM', checkpointSafe: false, kind: 'mcp' };
   if (['apply_patch', 'Edit', 'Write'].includes(name)) return { cost: 'MEDIUM', checkpointSafe: /(docs[\\/]plan|task_plan\.md|progress\.md|findings\.md|checkpoint|state\.md)/i.test(command), kind: 'edit' };
-  if (name === 'Bash' || lowerName === 'exec_command') {
-    if (/^\s*git\s+(status|diff)(\s|$)/i.test(command)) return { cost: 'LOW', checkpointSafe: true, kind: 'status' };
+  if (name === 'Bash' || ['exec_command', 'exec', 'functions.exec'].includes(lowerName)) {
+    const statusPattern = ['exec', 'functions.exec'].includes(lowerName)
+      ? /\bgit\s+(status|diff)(\s|$)/i
+      : /^\s*git\s+(status|diff)(\s|$)/i;
+    if (statusPattern.test(command)) return { cost: 'LOW', checkpointSafe: true, kind: 'status' };
+    if (['exec', 'functions.exec'].includes(lowerName)
+      && /(?:apply_patch|tools\.apply_patch)/i.test(command)
+      && /(docs[\\/]plan|task_plan\.md|progress\.md|findings\.md|checkpoint|state\.md)/i.test(command)) {
+      return { cost: 'MEDIUM', checkpointSafe: true, kind: 'edit' };
+    }
     if (/(--watch|--parallel|--all\b|\s-j\s*\d*|benchmark|dependency|\binstall\b|\brestore\b|\b(build|test)\b.*(--all|--parallel)|rg\s+--files|Get-ChildItem.*-Recurse)/i.test(command)) return { cost: 'HIGH', checkpointSafe: false, kind: 'bulk-shell' };
     return { cost: 'MEDIUM', checkpointSafe: /(Get-Content|type\s+).*(task_plan|progress|findings|checkpoint|state)/i.test(command), kind: 'shell' };
   }
@@ -459,6 +510,13 @@ function newTurnRecord(event) {
     resumeScheduleAttempted: false,
     resumeContinuationRequested: false,
     resumeScheduleKey: null,
+    pauseCandidate: false,
+    pauseReason: null,
+    pausePolicy: null,
+    pauseCandidateAt: null,
+    checkpointObserved: false,
+    pauseWindow: null,
+    pauseResetAt: null,
   };
 }
 
@@ -477,7 +535,9 @@ async function updateUsageSnapshot(event, turn = null) {
   try {
     const previousPlan = getValue(state, 'resumePlan');
     state = usageToState(await rateLimitQuery(), state);
-    const resume = resumePlanForState(state, event, previousPlan);
+    const classification = toolClassification(event);
+    const pause = classification.kind === 'resume-automation' && turn.pauseCandidate && turn.checkpointObserved ? turn : null;
+    const resume = resumePlanForState(state, event, previousPlan, pause);
     state.resumePlan = resume.plan;
     turn.usageChecked = true;
     turn.effectivePolicy = state.currentPolicy;
@@ -495,13 +555,64 @@ async function updateUsageSnapshot(event, turn = null) {
   }
 }
 
+function updatePauseCandidate(turn, state, classification, policy) {
+  if (!turn || classification.kind === 'resume-automation') return false;
+  let changed = false;
+  if (turn.pauseCandidate && turn.checkpointObserved && !classification.checkpointSafe) {
+    turn.pauseCandidate = false;
+    turn.pauseReason = null;
+    turn.pausePolicy = null;
+    turn.pauseCandidateAt = null;
+    turn.checkpointObserved = false;
+    turn.pauseWindow = null;
+    turn.pauseResetAt = null;
+    changed = true;
+  }
+  if (policy === 'CRITICAL' || policy === 'EMERGENCY') {
+    if (!turn.pauseCandidate) {
+      const windows = getValue(state, 'windows');
+      const reasonWindow = String(getValue(state, 'reasonWindow') ?? '');
+      const candidateWindow = ['primary', 'secondary'].find(name => name === reasonWindow && getValue(windows, name))
+        ?? ['primary', 'secondary'].find(name => {
+          const remaining = toNumber(getValue(getValue(windows, name), 'remainingPercent'));
+          return remaining !== null && remaining < 15;
+        })
+        ?? null;
+      turn.pauseCandidate = true;
+      turn.pauseReason = 'usage_guard';
+      turn.pausePolicy = policy;
+      turn.pauseCandidateAt = isoNow();
+      turn.pauseWindow = candidateWindow;
+      turn.pauseResetAt = candidateWindow === null ? null : toNumber(getValue(getValue(windows, candidateWindow), 'resetsAt'));
+      changed = true;
+    }
+    if (classification.checkpointSafe && !turn.checkpointObserved) {
+      turn.checkpointObserved = true;
+      changed = true;
+    }
+  } else if (turn.pauseCandidate && classification.checkpointSafe && !turn.checkpointObserved) {
+    turn.checkpointObserved = true;
+    changed = true;
+  }
+  return changed;
+}
+
 function matchingResumeAutomation(event, state) {
   const plan = getValue(state, 'resumePlan');
   if (!Boolean(getValue(plan, 'eligible'))) return false;
-  const key = String(getValue(plan, 'scheduleKey') ?? '');
-  if (!key) return false;
-  const inputText = toolCommandText(event);
-  return inputText.includes(key) && /usage[ -]guard/i.test(inputText);
+  const expected = resumeAutomationInput(plan);
+  const input = getValue(event, 'tool_input');
+  if (!expected || !input || typeof input !== 'object' || Array.isArray(input)) return false;
+  const prompt = getValue(input, 'prompt');
+  return getValue(input, 'mode') === expected.mode
+    && getValue(input, 'kind') === expected.kind
+    && getValue(input, 'destination') === expected.destination
+    && getValue(input, 'name') === expected.name
+    && getValue(input, 'rrule') === expected.rrule
+    && getValue(input, 'status') === expected.status
+    && typeof prompt === 'string'
+    && prompt.includes(String(getValue(plan, 'scheduleKey') ?? ''))
+    && /usage[ -]guard/i.test(prompt);
 }
 
 function removeExpiredTurns() {
@@ -523,13 +634,18 @@ function removeExpiredTurns() {
 async function preToolPolicy(event) {
   const classification = toolClassification(event);
   if (classification.kind === 'usage') return {};
-  let turn = getTurnRecord(event);
-  if (turn && Boolean(getValue(turn, 'overrideOnce'))) return contextOutput('PreToolUse', 'Usage Guard one-turn override is active. Continue deliberately; usage warnings still apply.');
-  if (!turn || (!Boolean(getValue(turn, 'usageAttempted')) && !Boolean(getValue(turn, 'usageChecked')))) turn = (await updateUsageSnapshot(event, turn)).turn;
-  let state = getState();
+  let turn = getTurnRecord(event) ?? newTurnRecord(event);
+  const override = Boolean(getValue(turn, 'overrideOnce'));
+  const refresh = await updateUsageSnapshot(event, turn);
+  turn = refresh.turn;
+  let state = refresh.state;
   let policy = String(getValue(state, 'currentPolicy') || 'UNKNOWN');
+  if (override) return contextOutput('PreToolUse', `Usage Guard one-turn override is active. Continue deliberately; usage warnings still apply. ${policySummary(state)}`);
+  if (updatePauseCandidate(turn, state, classification, policy)) saveTurnRecord(event, turn);
   if (classification.kind === 'resume-automation') {
-    if (policy !== 'EMERGENCY') return {};
+    const plan = getValue(state, 'resumePlan');
+    const planned = Boolean(getValue(plan, 'eligible')) && ['REQUESTED', 'SCHEDULED', 'FAILED'].includes(String(getValue(plan, 'status')));
+    if (policy !== 'EMERGENCY' && !planned) return {};
     if (!matchingResumeAutomation(event, state)) return denyOutput('Usage Guard EMERGENCY permits only the heartbeat matching the current recovery schedule key.');
     turn.resumeScheduleAttempted = true;
     turn.resumeScheduleKey = getValue(getValue(state, 'resumePlan'), 'scheduleKey');
@@ -537,12 +653,6 @@ async function preToolPolicy(event) {
     return contextOutput('PreToolUse', 'Usage Guard permits this matching bounded auto-resume heartbeat operation.');
   }
   if (policy === 'UNKNOWN') return contextOutput('PreToolUse', 'Usage state is UNKNOWN; fail-open is active. Continue cautiously and preserve a checkpoint after repeated failures.', 'Usage Guard could not read quota and is failing open.');
-  if (classification.cost === 'HIGH' && snapshotAgeSeconds(state) > FRESH_SECONDS) {
-    const refresh = await updateUsageSnapshot(event, turn);
-    state = refresh.state;
-    policy = String(getValue(state, 'currentPolicy') || 'UNKNOWN');
-    if (!refresh.succeeded && policy === 'UNKNOWN') return contextOutput('PreToolUse', 'Usage refresh failed before high-cost work; fail-open is active. Continue cautiously and preserve a bounded checkpoint.', 'Usage Guard could not refresh quota and is failing open.');
-  }
   if (policy === 'NORMAL') return {};
   if (policy === 'CONSERVE') {
     if (classification.kind === 'expansion') return denyOutput('Usage Guard CONSERVE blocks new subagents and generated-media expansion.');
@@ -649,7 +759,7 @@ async function invokeHookEvent(event) {
   const eventName = String(getValue(event, 'hook_event_name') ?? '');
   if (eventName === 'SessionStart') {
     removeExpiredTurns();
-    return contextOutput('SessionStart', `Usage Guard is active and queries Codex usage automatically on each user turn. ${policySummary(getState())}.`);
+    return contextOutput('SessionStart', `Usage Guard is active and queries Codex usage automatically on each user turn and before every tool call. ${policySummary(getState())}.`);
   }
   if (eventName === 'UserPromptSubmit') {
     const turn = newTurnRecord(event);
@@ -666,16 +776,36 @@ async function invokeHookEvent(event) {
   if (eventName === 'PostCompact') return { systemMessage: `Usage Guard state restored: ${policySummary(getState())}.` };
   if (eventName === 'Stop') {
     if (Boolean(getValue(event, 'stop_hook_active'))) return {};
-    const state = getState();
-    const plan = getValue(state, 'resumePlan');
+    let state = getState();
+    let plan = getValue(state, 'resumePlan');
     const turn = getTurnRecord(event);
+    let requested = Boolean(getValue(plan, 'eligible')) && String(getValue(plan, 'status')) === 'REQUESTED';
+    if (!requested && turn && Boolean(getValue(turn, 'pauseCandidate')) && Boolean(getValue(turn, 'checkpointObserved'))) {
+      const resume = resumePlanForState(state, event, plan, turn);
+      state.resumePlan = resume.plan;
+      plan = resume.plan;
+      requested = Boolean(getValue(plan, 'eligible')) && String(getValue(plan, 'status')) === 'REQUESTED';
+      writeJsonAtomic(statePath(), state);
+    }
+    const wakeAt = toNumber(getValue(plan, 'wakeAt'));
+    const nowUnix = Math.floor(utcNow().getTime() / 1000);
+    if (requested && (wakeAt === null || wakeAt <= nowUnix)) {
+      plan.eligible = false;
+      plan.status = 'SKIPPED_INVALID_RESET';
+      plan.lastError = 'Recovery wake time expired before scheduling.';
+      plan.updatedAt = isoNow();
+      state.resumePlan = plan;
+      writeJsonAtomic(statePath(), state);
+      return {};
+    }
     if (!turn) return {};
-    if (Boolean(getValue(plan, 'eligible')) && String(getValue(plan, 'status')) === 'REQUESTED' && !Boolean(getValue(turn, 'resumeScheduleAttempted')) && !Boolean(getValue(turn, 'resumeContinuationRequested'))) {
+    if (requested && !Boolean(getValue(turn, 'resumeScheduleAttempted')) && !Boolean(getValue(turn, 'resumeContinuationRequested'))) {
       turn.resumeContinuationRequested = true;
       saveTurnRecord(event, turn);
-      const wakeIso = new Date(Number(getValue(plan, 'wakeAt')) * 1000).toISOString();
+      const wakeIso = new Date(wakeAt * 1000).toISOString();
       const key = String(getValue(plan, 'scheduleKey') ?? '');
-      return { decision: 'block', reason: `Attempt the one Usage Guard same-thread heartbeat now with ${AUTOMATION_TOOL_NAME} for wakeAt=${wakeIso} scheduleKey=${key}. If the tool is unavailable, report that once, preserve the checkpoint, and stop; do not retry.` };
+      const input = resumeAutomationInput(plan);
+      return { decision: 'block', reason: `Attempt the one Usage Guard same-thread heartbeat now with ${AUTOMATION_TOOL_NAME} using this direct create input (do not use suggested_create and do not include DTSTART): ${JSON.stringify(input)} for wakeAt=${wakeIso} scheduleKey=${key}. If the tool is unavailable, report that once, preserve the checkpoint, and stop; do not retry.` };
     }
     return {};
   }
@@ -708,7 +838,7 @@ module.exports = {
   constants: { USAGE_TOOL_NAME, AUTOMATION_TOOL_NAME, FRESH_SECONDS, STALE_SECONDS, RESUME_SAFETY_SECONDS, RESUME_MAX_WAIT_SECONDS, LOCK_STALE_MS },
   utcNow, safeId, dataRoot, statePath, turnPath, readJsonFile, writeJsonAtomic,
   newResumePlan, newDefaultState, getState, toNumber, toWindow, findUsagePayload,
-  policyForRemaining, reasonCode, usageToState, resumePlanForState, resumePlanContext,
+  policyForRemaining, reasonCode, usageToState, resumePlanForState, resumeAutomationRrule, resumeAutomationInput, resumePlanContext,
   rateLimitQuery, snapshotAgeSeconds, registerUsageFailure, policySummary, contextOutput,
   denyOutput, toolCommandText, toolClassification, overridePrompt, newTurnRecord,
   getTurnRecord, saveTurnRecord, updateUsageSnapshot, matchingResumeAutomation,

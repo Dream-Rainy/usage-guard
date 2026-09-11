@@ -72,12 +72,13 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
   process.env.PLUGIN_DATA = testRoot;
   process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:00:00Z';
   const mockResponsePath = path.join(testRoot, 'mock-rate-limits.json');
-  g.writeJsonAtomic(mockResponsePath, {
+  const setMockUsage = (primaryUsed, secondaryUsed, primaryReset = 2000000000, secondaryReset = 2000001000) => g.writeJsonAtomic(mockResponsePath, {
     rateLimits: {
-      primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 2000000000 },
-      secondary: { usedPercent: 20, windowDurationMins: 10080, resetsAt: 2000001000 },
+      primary: { usedPercent: primaryUsed, windowDurationMins: 300, resetsAt: primaryReset },
+      secondary: { usedPercent: secondaryUsed, windowDurationMins: 10080, resetsAt: secondaryReset },
     },
   });
+  setMockUsage(10, 20);
   process.env.USAGE_GUARD_TEST_RESPONSE_PATH = mockResponsePath;
 
   try {
@@ -114,8 +115,12 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     assert.deepEqual([statusClass.cost, statusClass.checkpointSafe], ['LOW', true]);
     const scanClass = g.toolClassification(event('PreToolUse', 'Bash', 'rg --files'));
     assert.deepEqual([scanClass.cost, scanClass.checkpointSafe], ['HIGH', false]);
+    const wrappedStatusClass = g.toolClassification(event('PreToolUse', 'exec', 'text(await tools.exec_command({cmd:\"git status --short\"}))'));
+    assert.deepEqual([wrappedStatusClass.cost, wrappedStatusClass.checkpointSafe], ['LOW', true]);
     const planClass = g.toolClassification(event('PreToolUse', 'apply_patch', '*** Update File: docs/plan/progress.md'));
     assert.deepEqual([planClass.cost, planClass.checkpointSafe], ['MEDIUM', true]);
+    const wrappedPlanClass = g.toolClassification(event('PreToolUse', 'exec', 'text(await tools.apply_patch("*** Update File: docs/plan/progress.md"))'));
+    assert.deepEqual([wrappedPlanClass.cost, wrappedPlanClass.checkpointSafe], ['MEDIUM', true]);
 
     const fixtures = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'events.json'), 'utf8'));
     for (const eventName of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'PostCompact', 'SubagentStart', 'Stop', 'SessionEnd']) {
@@ -135,9 +140,10 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     g.writeJsonAtomic(g.statePath(), freshState);
     record = { ...record, usageAttempted: true, usageChecked: true, overrideOnce: false };
     g.saveTurnRecord(turnEvent, record);
+    process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:07:00Z';
     const before = g.getState().lastSuccessfulAt;
     await g.preToolPolicy(event('PreToolUse', 'Bash', 'git status --short'));
-    assert.equal(g.getState().lastSuccessfulAt, before);
+    assert.notEqual(g.getState().lastSuccessfulAt, before);
 
     const stopTurn = event('UserPromptSubmit');
     stopTurn.turn_id = 'stop-turn';
@@ -150,10 +156,30 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
 
     const emergency = g.usageToState(usageResponse(95, 93), g.newDefaultState());
     g.writeJsonAtomic(g.statePath(), emergency);
+    setMockUsage(95, 93);
     record.effectivePolicy = 'EMERGENCY';
     g.saveTurnRecord(turnEvent, record);
     assert.equal((await g.preToolPolicy(event('PreToolUse', 'Bash', 'git diff --stat'))).hookSpecificOutput.permissionDecision, undefined);
     assert.equal((await g.preToolPolicy(event('PreToolUse', 'Bash', 'rg --files'))).hookSpecificOutput.permissionDecision, 'deny');
+
+    const pauseNow = Date.parse(process.env.USAGE_GUARD_NOW_UTC) / 1000;
+    const pauseReset = pauseNow + 1800;
+    setMockUsage(86, 20, pauseReset, pauseNow + 50000);
+    const pauseEvent = event('PreToolUse', 'exec', 'text(await tools.apply_patch("*** Update File: docs/plan/progress.md"))');
+    pauseEvent.turn_id = 'pause-turn';
+    const pauseContext = await g.preToolPolicy(pauseEvent);
+    assert.match(pauseContext.hookSpecificOutput.additionalContext, /CRITICAL/);
+    const pauseRecord = g.getTurnRecord(pauseEvent);
+    assert.equal(pauseRecord.pauseCandidate, true);
+    assert.equal(pauseRecord.pauseReason, 'usage_guard');
+    assert.equal(pauseRecord.checkpointObserved, true);
+    g.writeJsonAtomic(g.statePath(), g.usageToState(usageResponse(10, 20, pauseReset, pauseNow + 50000), g.getState()));
+    const pauseStop = event('Stop');
+    pauseStop.turn_id = 'pause-turn';
+    const pauseDecision = await g.invokeHookEvent(pauseStop);
+    assert.equal(pauseDecision.decision, 'block');
+    assert.match(pauseDecision.reason, /"mode":"create"/);
+    assert.equal(g.getState().resumePlan.status, 'REQUESTED');
 
     process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:00:00Z';
     const nowUnix = Date.parse(process.env.USAGE_GUARD_NOW_UTC) / 1000;
@@ -181,14 +207,27 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     assert.equal(duplicate.requestCreated, false);
     assert.equal(duplicate.plan.scheduleKey, exactPlanResult.plan.scheduleKey);
 
+    const resumeInput = g.resumeAutomationInput(exactPlanResult.plan);
+    assert.deepEqual(
+      { mode: resumeInput.mode, kind: resumeInput.kind, destination: resumeInput.destination, name: resumeInput.name, status: resumeInput.status },
+      { mode: 'create', kind: 'heartbeat', destination: 'thread', name: 'Usage Guard resume', status: 'ACTIVE' },
+    );
+    assert.match(resumeInput.rrule, /^RRULE:FREQ=DAILY;BYHOUR=\d{2};BYMINUTE=\d{2};BYSECOND=\d{2};COUNT=1$/);
+    assert.match(resumeInput.prompt, new RegExp(exactPlanResult.plan.scheduleKey));
+    assert.equal(g.resumeAutomationRrule(null), null);
+
     exactState.resumePlan = exactPlanResult.plan;
     g.writeJsonAtomic(g.statePath(), exactState);
+    setMockUsage(95, 20, exactReset, nowUnix + 50000);
     const autoTurn = { ...g.newTurnRecord(resumeEvent), usageAttempted: true, usageChecked: true };
     g.saveTurnRecord(resumeEvent, autoTurn);
     const autoEvent = event('PreToolUse', g.constants.AUTOMATION_TOOL_NAME);
-    autoEvent.tool_input = { name: 'Usage Guard resume', prompt: `Usage Guard recovery scheduleKey=${exactPlanResult.plan.scheduleKey}` };
+    autoEvent.tool_input = resumeInput;
     assert.equal((await g.preToolPolicy(autoEvent)).hookSpecificOutput.permissionDecision, undefined);
     assert.equal(g.getTurnRecord(autoEvent).resumeScheduleAttempted, true);
+    const suggested = event('PreToolUse', g.constants.AUTOMATION_TOOL_NAME);
+    suggested.tool_input = { ...resumeInput, mode: 'suggested_create' };
+    assert.equal((await g.preToolPolicy(suggested)).hookSpecificOutput.permissionDecision, 'deny');
     const unrelated = event('PreToolUse', g.constants.AUTOMATION_TOOL_NAME);
     unrelated.tool_input = { name: 'Other task', prompt: 'Unrelated automation' };
     assert.equal((await g.preToolPolicy(unrelated)).hookSpecificOutput.permissionDecision, 'deny');
@@ -211,11 +250,35 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     g.automationPostTool(genericPost);
     assert.equal(g.getState().resumePlan.status, 'FAILED');
 
+    const expiredState = structuredClone(exactState);
+    expiredState.resumePlan = structuredClone(exactPlanResult.plan);
+    expiredState.resumePlan.wakeAt = nowUnix - 1;
+    expiredState.resumePlan.status = 'REQUESTED';
+    expiredState.resumePlan.eligible = true;
+    g.writeJsonAtomic(g.statePath(), expiredState);
+    setMockUsage(95, 20, nowUnix - 1, nowUnix + 50000);
+    const expiredStopEvent = event('Stop');
+    expiredStopEvent.turn_id = 'expired-stop-turn';
+    g.saveTurnRecord(expiredStopEvent, { ...g.newTurnRecord(expiredStopEvent), usageAttempted: true, usageChecked: true });
+    assert.equal((await g.invokeHookEvent(expiredStopEvent)).decision, undefined);
+    assert.equal(g.getState().resumePlan.status, 'SKIPPED_INVALID_RESET');
+    assert.equal(g.getState().resumePlan.eligible, false);
+    assert.equal((await g.invokeHookEvent(expiredStopEvent)).decision, undefined);
+    const expiredAutomation = event('PreToolUse', g.constants.AUTOMATION_TOOL_NAME);
+    expiredAutomation.turn_id = 'expired-automation-turn';
+    expiredAutomation.tool_input = { name: 'Usage Guard resume', prompt: `Usage Guard recovery scheduleKey=${exactPlanResult.plan.scheduleKey}` };
+    g.saveTurnRecord(expiredAutomation, { ...g.newTurnRecord(expiredAutomation), usageAttempted: true, usageChecked: true });
+    assert.equal((await g.preToolPolicy(expiredAutomation)).hookSpecificOutput.permissionDecision, 'deny');
+
     exactState.resumePlan = exactPlanResult.plan;
     g.writeJsonAtomic(g.statePath(), exactState);
     const stopEvent = event('Stop');
     g.saveTurnRecord(stopEvent, { ...g.newTurnRecord(stopEvent), usageAttempted: true, usageChecked: true });
-    assert.equal((await g.invokeHookEvent(stopEvent)).decision, 'block');
+    const stopDecision = await g.invokeHookEvent(stopEvent);
+    assert.equal(stopDecision.decision, 'block');
+    assert.match(stopDecision.reason, /"mode":"create"/);
+    assert.match(stopDecision.reason, /"destination":"thread"/);
+    assert.match(stopDecision.reason, /"rrule":"RRULE:FREQ=DAILY;/);
     assert.equal((await g.invokeHookEvent(stopEvent)).decision, undefined);
     stopEvent.stop_hook_active = true;
     assert.equal((await g.invokeHookEvent(stopEvent)).decision, undefined);
@@ -248,6 +311,7 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     }
 
     const processRoot = path.join(testRoot, 'process-smoke');
+    setMockUsage(10, 20);
     const processResult = await runHandler(JSON.stringify(event('UserPromptSubmit')), {
       PLUGIN_DATA: processRoot,
       USAGE_GUARD_TEST_RESPONSE_PATH: mockResponsePath,
