@@ -6,6 +6,14 @@ Usage Guard is a cross-platform Codex plugin that checks Codex usage at lifecycl
 
 The runtime uses only Node.js built-in modules and supports Windows, macOS, and Linux. Node.js 18 or newer and the Codex CLI must be available on `PATH`.
 
+## Policy model
+
+Usage Guard keeps the short (5-hour) and weekly (7-day) windows independent:
+
+- The short window is a resumable scheduling boundary: `RUN`, `CONSERVE`, `CRITICAL`, then an 8% interruption reserve before suspension.
+- The weekly window is the total budget: `HEALTHY`, `LOW`, `FINALIZE`, and `STOP` below 5%. Weekly `STOP` never creates a heartbeat.
+- A same-thread heartbeat is requested only after a verified `docs/plan/usage-guard-checkpoint.json` marker. The marker is registered by `PostToolUse` and each recovery cycle gets a new schedule key.
+
 ## Install from GitHub
 
 ```bash

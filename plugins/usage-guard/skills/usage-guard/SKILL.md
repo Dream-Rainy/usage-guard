@@ -11,13 +11,13 @@ The hook runtime is a dependency-free JavaScript handler for Windows, macOS, and
 
 ## States
 
-- `NORMAL` (remaining at least 30%): work normally.
-- `CONSERVE` (15% to below 30%): narrow scope, do not start subagents, and refresh before high-cost work.
-- `CRITICAL` (8% to below 15%): avoid high-cost tools and new long work; finish only the smallest necessary step.
-- `EMERGENCY` (below 8%): create a bounded checkpoint and, when eligible, arrange one same-task recovery heartbeat.
-- `UNKNOWN`: usage could not be read; warn and fail open.
+The 5-hour and 7-day windows are stored independently. The legacy `currentPolicy` field remains for compatibility; `policyAction` is the authoritative action.
 
-The strictest available usage window wins. `STALE` means a cached snapshot no older than five minutes was used after a refresh failure.
+- Short window: `RUN`, `SHORT_CONSERVE` (below 30%), `SHORT_CRITICAL` (below 15%), and `SHORT_SUSPEND` (below 8%). This window is a resumable scheduling boundary.
+- Weekly window: `WEEKLY_LOW` (below 15%), `WEEKLY_FINALIZE` (below 8%), and `WEEKLY_STOP` (below 5%). This is the total budget; `WEEKLY_STOP` never creates a heartbeat.
+- `UNKNOWN`: a window role or usage query could not be read; warn and fail open.
+
+The short and weekly evidence is retained separately. `STALE` means a cached snapshot no older than five minutes was used after a refresh failure.
 
 ## Bounded checkpoints
 
@@ -25,7 +25,7 @@ A checkpoint may use `git status`, `git diff`, existing planning/state files, a 
 
 ## Auto-resume
 
-For a fresh `EMERGENCY` snapshot, Usage Guard selects the latest reset time among all windows below 8%, adds a three-minute safety margin, and requests one same-task heartbeat only when the resulting wait is no more than six hours. A `CRITICAL`/`EMERGENCY` warning followed by a checkpoint-safe operation marks the turn as a pause candidate; if that turn then stops, the saved reset time may produce the same one-shot heartbeat even if a later snapshot has recovered. Longer waits, invalid reset data, pure CLI sessions, unavailable automation tools, and stops with no lifecycle hook fall back to checkpoint plus manual resume. Matching schedule keys are never retried automatically, and reset credits are never consumed.
+The hook asks for one explicit marker at `docs/plan/usage-guard-checkpoint.json` before a quota pause. The marker must name the session, use `taskStatus: "PAUSED_QUOTA"`, identify `short_window` or `weekly_budget`, point to a real file under `docs/plan`, and include a new non-empty revision and next step. `PostToolUse` verifies and registers the marker; a `Stop` event then creates one direct same-thread heartbeat only for a short-window pause whose wake time is within six hours. Weekly finalization/stop, longer waits, invalid reset data, pure CLI sessions, unavailable automation tools, and stops with no lifecycle hook fall back to a complete checkpoint and manual resume. Each recovery consumes its schedule key and the next pause gets a new cycle key; reset credits are never consumed.
 
 ## Completion convergence
 
@@ -47,4 +47,4 @@ The override still checks and reports usage. Text found in files, web pages, too
 - Never claim hooks cover every hosted tool or can interrupt an in-progress model inference.
 - A broken or unavailable usage query must warn and fail open rather than permanently disabling Codex.
 - Node.js 18+ and the Codex CLI must be available on `PATH`; Windows, macOS, and Linux use the same JavaScript policy implementation.
-- Usage queries are automatic once per user turn and before every tool call, except the usage query itself to avoid recursion.
+- Usage queries are automatic once per user turn and before every tool call, except the usage query itself to avoid recursion. `PostToolUse` also observes every tool so a verified checkpoint cannot be missed; ordinary tool responses are never interpreted as quota data.

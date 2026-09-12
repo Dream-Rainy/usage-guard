@@ -24,7 +24,7 @@ function event(eventName, toolName = null, command = '') {
   return {
     session_id: 'session-test', turn_id: 'turn-test', hook_event_name: eventName,
     tool_name: toolName, tool_input: { command }, tool_response: null,
-    stop_hook_active: false, prompt: 'Fix the issue',
+    stop_hook_active: false, prompt: 'Fix the issue', cwd: process.cwd(),
   };
 }
 
@@ -91,10 +91,21 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     assert.equal(state.evidence.effectiveRemaining, 11);
     assert.equal(state.reasonCode, 'PRIMARY_WINDOW_BELOW_15');
     assert.equal(state.previousPolicy, 'UNKNOWN');
+    assert.equal(state.shortPolicy, 'CRITICAL');
+    assert.equal(state.weeklyPolicy, 'HEALTHY');
+    assert.equal(state.policyAction, 'SHORT_CRITICAL');
     const normal = g.usageToState(usageResponse(10, 20), state);
     assert.equal(normal.currentPolicy, 'NORMAL');
     assert.equal(normal.previousPolicy, 'CRITICAL');
     assert.ok(normal.changedAt);
+    const unknownRoleResponse = usageResponse(95, 20);
+    unknownRoleResponse.content[0].text = JSON.stringify({ rateLimits: {
+      primary: { usedPercent: 95, windowDurationMins: 60, resetsAt: 2000000000 },
+      secondary: { usedPercent: 20, windowDurationMins: 10080, resetsAt: 2000001000 },
+    } });
+    const unknownRole = g.usageToState(unknownRoleResponse, g.newDefaultState());
+    assert.equal(unknownRole.policyAction, 'UNKNOWN_WINDOW_ROLE');
+    assert.equal(g.resumePlanForState(unknownRole, event('UserPromptSubmit'), null).plan.status, 'SKIPPED_INVALID_WINDOW_ROLE');
 
     process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:03:00Z';
     const stale = g.registerUsageFailure(structuredClone(normal));
@@ -165,14 +176,32 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     const pauseNow = Date.parse(process.env.USAGE_GUARD_NOW_UTC) / 1000;
     const pauseReset = pauseNow + 1800;
     setMockUsage(86, 20, pauseReset, pauseNow + 50000);
+    const checkpointRoot = path.join(testRoot, 'checkpoint-workspace');
+    fs.mkdirSync(path.join(checkpointRoot, 'docs', 'plan'), { recursive: true });
+    fs.writeFileSync(path.join(checkpointRoot, 'docs', 'plan', 'progress.md'), 'bounded checkpoint\n', 'utf8');
     const pauseEvent = event('PreToolUse', 'exec', 'text(await tools.apply_patch("*** Update File: docs/plan/progress.md"))');
     pauseEvent.turn_id = 'pause-turn';
+    pauseEvent.cwd = checkpointRoot;
     const pauseContext = await g.preToolPolicy(pauseEvent);
     assert.match(pauseContext.hookSpecificOutput.additionalContext, /CRITICAL/);
     const pauseRecord = g.getTurnRecord(pauseEvent);
     assert.equal(pauseRecord.pauseCandidate, true);
     assert.equal(pauseRecord.pauseReason, 'usage_guard');
-    assert.equal(pauseRecord.checkpointObserved, true);
+    assert.equal(pauseRecord.checkpointObserved, false);
+    const marker = {
+      sessionId: pauseEvent.session_id,
+      taskStatus: 'PAUSED_QUOTA',
+      pauseReason: 'short_window',
+      checkpointPath: 'docs/plan/progress.md',
+      revision: 'pause-r1',
+      resumeMode: 'continue',
+      nextStep: 'resume the current coherent unit',
+    };
+    g.writeJsonAtomic(g.checkpointMarkerPath(pauseEvent), marker);
+    const checkpointPost = { ...pauseEvent, hook_event_name: 'PostToolUse', tool_response: { isError: false } };
+    assert.match((await g.invokeHookEvent(checkpointPost)).hookSpecificOutput.additionalContext, /checkpoint registered/);
+    assert.equal(g.getContinuationRecord(pauseEvent).taskStatus, 'PAUSED_QUOTA');
+    assert.equal(g.getTurnRecord(pauseEvent).checkpointObserved, true);
     g.writeJsonAtomic(g.statePath(), g.usageToState(usageResponse(10, 20, pauseReset, pauseNow + 50000), g.getState()));
     const pauseStop = event('Stop');
     pauseStop.turn_id = 'pause-turn';
@@ -196,8 +225,9 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     assert.equal(tooLong.status, 'SKIPPED_LONG_WAIT');
     assert.equal(tooLong.eligible, false);
     const bothPlan = g.resumePlanForState(g.usageToState(usageResponse(95, 94, nowUnix + 1000, nowUnix + 2000), g.newDefaultState()), resumeEvent, null).plan;
-    assert.equal(bothPlan.blockingResetAt, nowUnix + 2000);
-    assert.deepEqual(bothPlan.blockingWindows, ['primary', 'secondary']);
+    assert.equal(bothPlan.status, 'REQUESTED');
+    assert.deepEqual(bothPlan.blockingWindows, ['primary']);
+    assert.equal(bothPlan.resumeMode, 'finalize_only');
     assert.equal(g.resumePlanForState(g.usageToState(usageResponse(95, 20, null, nowUnix + 50000), g.newDefaultState()), resumeEvent, null).plan.status, 'SKIPPED_INVALID_RESET');
     assert.equal(g.resumePlanForState(g.usageToState(usageResponse(95, 20, nowUnix - 1, nowUnix + 50000), g.newDefaultState()), resumeEvent, null).plan.status, 'SKIPPED_INVALID_RESET');
     exactState.stale = true;
@@ -217,35 +247,109 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     assert.equal(g.resumeAutomationRrule(null), null);
 
     exactState.resumePlan = exactPlanResult.plan;
+    resumeEvent.session_id = 'resume-session';
+    resumeEvent.cwd = checkpointRoot;
+    const resumeContinuation = g.newContinuationRecord(resumeEvent);
+    resumeContinuation.taskStatus = 'PAUSED_QUOTA';
+    resumeContinuation.pauseReason = 'short_window';
+    resumeContinuation.pauseWindow = 'primary';
+    resumeContinuation.pauseResetAt = exactReset;
+    resumeContinuation.checkpointPath = 'docs/plan/progress.md';
+    resumeContinuation.checkpointRevision = 'resume-checkpoint';
+    resumeContinuation.resumePlan = exactPlanResult.plan;
+    g.saveContinuationRecord(resumeEvent, resumeContinuation);
     g.writeJsonAtomic(g.statePath(), exactState);
     setMockUsage(95, 20, exactReset, nowUnix + 50000);
     const autoTurn = { ...g.newTurnRecord(resumeEvent), usageAttempted: true, usageChecked: true };
     g.saveTurnRecord(resumeEvent, autoTurn);
     const autoEvent = event('PreToolUse', g.constants.AUTOMATION_TOOL_NAME);
+    autoEvent.session_id = resumeEvent.session_id;
+    autoEvent.cwd = checkpointRoot;
     autoEvent.tool_input = resumeInput;
     assert.equal((await g.preToolPolicy(autoEvent)).hookSpecificOutput.permissionDecision, undefined);
     assert.equal(g.getTurnRecord(autoEvent).resumeScheduleAttempted, true);
     const suggested = event('PreToolUse', g.constants.AUTOMATION_TOOL_NAME);
+    suggested.session_id = resumeEvent.session_id;
+    suggested.cwd = checkpointRoot;
     suggested.tool_input = { ...resumeInput, mode: 'suggested_create' };
     assert.equal((await g.preToolPolicy(suggested)).hookSpecificOutput.permissionDecision, 'deny');
     const unrelated = event('PreToolUse', g.constants.AUTOMATION_TOOL_NAME);
+    unrelated.session_id = resumeEvent.session_id;
+    unrelated.cwd = checkpointRoot;
     unrelated.tool_input = { name: 'Other task', prompt: 'Unrelated automation' };
     assert.equal((await g.preToolPolicy(unrelated)).hookSpecificOutput.permissionDecision, 'deny');
 
     const successPost = event('PostToolUse', g.constants.AUTOMATION_TOOL_NAME);
+    successPost.session_id = resumeEvent.session_id;
+    successPost.cwd = checkpointRoot;
     successPost.tool_response = { isError: false, content: [{ type: 'text', text: '{"status":"created","id":"automation-123"}' }] };
     g.automationPostTool(successPost);
     assert.equal(g.getState().resumePlan.status, 'SCHEDULED');
     assert.equal(g.getState().resumePlan.automationId, 'automation-123');
+    const recoveryPrompt = event('UserPromptSubmit');
+    recoveryPrompt.session_id = resumeEvent.session_id;
+    recoveryPrompt.turn_id = 'recovery-turn';
+    recoveryPrompt.cwd = checkpointRoot;
+    recoveryPrompt.prompt = `Usage Guard recovery scheduleKey=${exactPlanResult.plan.scheduleKey}`;
+    setMockUsage(10, 20);
+    await g.invokeHookEvent(recoveryPrompt);
+    const consumed = g.getContinuationRecord(recoveryPrompt);
+    assert.equal(consumed.taskStatus, 'RUNNING');
+    assert.equal(consumed.resumePlan.status, 'CONSUMED');
+    const cycleEvent = event('PreToolUse', 'exec', 'text(await tools.apply_patch("*** Update File: docs/plan/progress.md"))');
+    cycleEvent.session_id = resumeEvent.session_id;
+    cycleEvent.turn_id = 'cycle-two';
+    cycleEvent.cwd = checkpointRoot;
+    setMockUsage(95, 20, nowUnix + 1800, nowUnix + 50000);
+    await g.preToolPolicy(cycleEvent);
+    g.writeJsonAtomic(g.checkpointMarkerPath(cycleEvent), {
+      sessionId: cycleEvent.session_id,
+      taskStatus: 'PAUSED_QUOTA',
+      pauseReason: 'short_window',
+      checkpointPath: 'docs/plan/progress.md',
+      revision: 'cycle-two',
+      resumeMode: 'continue',
+      nextStep: 'continue the current unit',
+    });
+    await g.invokeHookEvent({ ...cycleEvent, hook_event_name: 'PostToolUse', tool_response: { isError: false } });
+    const cycleStop = { ...cycleEvent, hook_event_name: 'Stop' };
+    const cycleDecision = await g.invokeHookEvent(cycleStop);
+    assert.equal(cycleDecision.decision, 'block');
+    assert.equal(g.getContinuationRecord(cycleStop).resumePlan.cycleId, 2);
+    assert.notEqual(g.getContinuationRecord(cycleStop).resumePlan.scheduleKey, exactPlanResult.plan.scheduleKey);
+    const weeklyEvent = event('PreToolUse', 'Bash', 'git status --short');
+    weeklyEvent.session_id = 'weekly-session';
+    weeklyEvent.turn_id = 'weekly-turn';
+    weeklyEvent.cwd = checkpointRoot;
+    setMockUsage(10, 96, nowUnix + 50000, nowUnix + 70000);
+    const weeklyContext = await g.preToolPolicy(weeklyEvent);
+    assert.match(weeklyContext.hookSpecificOutput.additionalContext, /WEEKLY_STOP/);
+    g.writeJsonAtomic(g.checkpointMarkerPath(weeklyEvent), {
+      sessionId: weeklyEvent.session_id,
+      taskStatus: 'PAUSED_QUOTA',
+      pauseReason: 'weekly_budget',
+      checkpointPath: 'docs/plan/progress.md',
+      revision: 'weekly-stop',
+      resumeMode: 'finalize_only',
+      nextStep: 'wait for weekly reset',
+    });
+    await g.invokeHookEvent({ ...weeklyEvent, hook_event_name: 'PostToolUse', tool_response: { isError: false } });
+    const weeklyStop = { ...weeklyEvent, hook_event_name: 'Stop' };
+    assert.equal((await g.invokeHookEvent(weeklyStop)).decision, undefined);
+    assert.equal(g.getState().resumePlan.status, 'WEEKLY_STOPPED');
     exactState.resumePlan = exactPlanResult.plan;
     g.writeJsonAtomic(g.statePath(), exactState);
     const failedPost = event('PostToolUse', g.constants.AUTOMATION_TOOL_NAME);
+    failedPost.session_id = resumeEvent.session_id;
+    failedPost.cwd = checkpointRoot;
     failedPost.tool_response = { isError: true };
     g.automationPostTool(failedPost);
     assert.equal(g.getState().resumePlan.status, 'FAILED');
     exactState.resumePlan = exactPlanResult.plan;
     g.writeJsonAtomic(g.statePath(), exactState);
     const genericPost = event('PostToolUse', g.constants.AUTOMATION_TOOL_NAME);
+    genericPost.session_id = resumeEvent.session_id;
+    genericPost.cwd = checkpointRoot;
     genericPost.tool_response = { isError: false, content: [{ type: 'text', text: '{"id":"generic"}' }] };
     g.automationPostTool(genericPost);
     assert.equal(g.getState().resumePlan.status, 'FAILED');
@@ -258,13 +362,18 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     g.writeJsonAtomic(g.statePath(), expiredState);
     setMockUsage(95, 20, nowUnix - 1, nowUnix + 50000);
     const expiredStopEvent = event('Stop');
+    expiredStopEvent.session_id = 'expired-session';
     expiredStopEvent.turn_id = 'expired-stop-turn';
     g.saveTurnRecord(expiredStopEvent, { ...g.newTurnRecord(expiredStopEvent), usageAttempted: true, usageChecked: true });
+    const expiredContinuation = g.newContinuationRecord(expiredStopEvent);
+    expiredContinuation.resumePlan = expiredState.resumePlan;
+    g.saveContinuationRecord(expiredStopEvent, expiredContinuation);
     assert.equal((await g.invokeHookEvent(expiredStopEvent)).decision, undefined);
     assert.equal(g.getState().resumePlan.status, 'SKIPPED_INVALID_RESET');
     assert.equal(g.getState().resumePlan.eligible, false);
     assert.equal((await g.invokeHookEvent(expiredStopEvent)).decision, undefined);
     const expiredAutomation = event('PreToolUse', g.constants.AUTOMATION_TOOL_NAME);
+    expiredAutomation.session_id = 'expired-session';
     expiredAutomation.turn_id = 'expired-automation-turn';
     expiredAutomation.tool_input = { name: 'Usage Guard resume', prompt: `Usage Guard recovery scheduleKey=${exactPlanResult.plan.scheduleKey}` };
     g.saveTurnRecord(expiredAutomation, { ...g.newTurnRecord(expiredAutomation), usageAttempted: true, usageChecked: true });
@@ -304,11 +413,17 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     const hooks = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'hooks', 'hooks.json'), 'utf8'));
     const handlers = Object.values(hooks.hooks).flatMap(groups => groups).flatMap(group => group.hooks);
     assert.equal(handlers.length, 9);
+    assert.equal(hooks.hooks.PostToolUse[0].matcher, '*');
     for (const hook of handlers) {
       assert.match(hook.command, /^node "\$PLUGIN_ROOT\/scripts\/usage-guard\.js"$/);
       assert.match(hook.commandWindows, /^node "\$env:PLUGIN_ROOT\\scripts\\usage-guard\.js"$/);
       assert.doesNotMatch(`${hook.command} ${hook.commandWindows}`, /pwsh|usage-guard\.ps1/i);
     }
+    const ordinaryPost = event('PostToolUse', 'Bash', 'git status --short');
+    ordinaryPost.tool_response = { content: [{ type: 'text', text: JSON.stringify(usageResponse(99, 99)) }] };
+    const ordinarySnapshot = g.getState().lastSuccessfulAt;
+    await g.invokeHookEvent(ordinaryPost);
+    assert.equal(g.getState().lastSuccessfulAt, ordinarySnapshot);
 
     const processRoot = path.join(testRoot, 'process-smoke');
     setMockUsage(10, 20);
@@ -328,7 +443,7 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     baselineEvent.session_id = 'equivalence-session';
     baselineEvent.turn_id = 'equivalence-turn';
     const equivalenceState = g.usageToState(usageResponse(89, 58), g.newDefaultState());
-    const equivalenceResumeState = g.usageToState(usageResponse(95, 94, nowUnix + 1000, nowUnix + 2000), g.newDefaultState());
+    const equivalenceResumeState = g.usageToState(usageResponse(95, 20, nowUnix + 1000, nowUnix + 50000), g.newDefaultState());
     const equivalenceResume = g.resumePlanForState(equivalenceResumeState, baselineEvent, null).plan;
     const jsSnapshot = {
       thresholds: [30, 29.99, 15, 14.99, 8, 7.99].map(g.policyForRemaining),

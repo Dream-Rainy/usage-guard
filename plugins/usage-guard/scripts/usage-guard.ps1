@@ -10,6 +10,7 @@ $script:StaleSeconds = 300
 $script:QueryTimeoutSeconds = 10
 $script:ResumeSafetySeconds = 180
 $script:ResumeMaxWaitSeconds = 21600
+$script:CheckpointRelativePath = [System.IO.Path]::Combine('docs', 'plan', 'usage-guard-checkpoint.json')
 
 function Get-UtcNow {
     if ($env:USAGE_GUARD_NOW_UTC) {
@@ -47,6 +48,11 @@ function Get-DataRoot {
 
 function Get-StatePath {
     return [System.IO.Path]::Combine((Get-DataRoot), 'state.json')
+}
+
+function Get-ContinuationPath {
+    param([string]$SessionId)
+    return [System.IO.Path]::Combine((Get-DataRoot), 'sessions', "$(ConvertTo-SafeId $SessionId).json")
 }
 
 function Get-TurnPath {
@@ -98,12 +104,18 @@ function New-DefaultState {
         schemaVersion = 2
         lastSuccessfulAt = $null
         windows = [ordered]@{ primary = $null; secondary = $null }
+        windowRoles = [ordered]@{ short = $null; weekly = $null }
+        windowRoleErrors = @()
         previousPolicy = $null
+        previousAction = $null
         currentPolicy = 'UNKNOWN'
+        shortPolicy = 'UNKNOWN'
+        weeklyPolicy = 'UNKNOWN'
+        policyAction = 'UNKNOWN'
         changedAt = $null
         reasonCode = 'NO_SNAPSHOT'
         reasonWindow = $null
-        evidence = [ordered]@{ primaryRemaining = $null; secondaryRemaining = $null; effectiveRemaining = $null }
+        evidence = [ordered]@{ primaryRemaining = $null; secondaryRemaining = $null; effectiveRemaining = $null; shortRemaining = $null; weeklyRemaining = $null }
         stale = $false
         consecutiveFailures = 0
         resumePlan = [ordered]@{
@@ -113,6 +125,8 @@ function New-DefaultState {
             wakeAt = $null
             waitSeconds = $null
             scheduleKey = $null
+            cycleId = 0
+            resumeMode = 'continue'
             status = 'NONE'
             automationId = $null
             lastError = $null
@@ -144,12 +158,15 @@ function ConvertTo-Window {
     $used = ConvertTo-Number (Get-Value $Window 'usedPercent')
     if ($null -eq $used) { return $null }
     $used = [Math]::Max(0, [Math]::Min(100, $used))
+    $duration = ConvertTo-Number (Get-Value $Window 'windowDurationMins')
+    $role = if ($duration -eq 300) { 'short' } elseif ($duration -eq 10080) { 'weekly' } else { $null }
     $remaining = [Math]::Round(100 - $used, 2)
     return [ordered]@{
         name = $Name
         usedPercent = $used
         remainingPercent = $remaining
-        windowDurationMins = ConvertTo-Number (Get-Value $Window 'windowDurationMins')
+        windowDurationMins = $duration
+        role = $role
         resetsAt = Get-Value $Window 'resetsAt'
     }
 }
@@ -196,6 +213,56 @@ function Get-PolicyForRemaining {
     return 'NORMAL'
 }
 
+function Get-WeeklyPolicyForRemaining {
+    param([double]$Remaining)
+    if ($Remaining -lt 5) { return 'STOP' }
+    if ($Remaining -lt 8) { return 'FINALIZE' }
+    if ($Remaining -lt 15) { return 'LOW' }
+    return 'HEALTHY'
+}
+
+function Get-PolicySeverity {
+    param([string]$Policy)
+    $map = @{ NORMAL = 0; HEALTHY = 0; CONSERVE = 1; LOW = 1; CRITICAL = 2; FINALIZE = 2; EMERGENCY = 3; STOP = 4 }
+    if ($map.ContainsKey($Policy)) { return $map[$Policy] }
+    return -1
+}
+
+function Get-CombinedPolicy {
+    param([string]$ShortPolicy, [string]$WeeklyPolicy, [string]$Fallback = 'UNKNOWN')
+    $weeklyEquivalent = @{ HEALTHY = 'NORMAL'; LOW = 'CONSERVE'; FINALIZE = 'CRITICAL'; STOP = 'EMERGENCY' }[$WeeklyPolicy]
+    $candidates = @($ShortPolicy, $weeklyEquivalent, $Fallback) | Where-Object { $_ -and $_ -ne 'UNKNOWN' }
+    if ($candidates.Count -eq 0) { return 'UNKNOWN' }
+    return ($candidates | Sort-Object { Get-PolicySeverity $_ } -Descending | Select-Object -First 1)
+}
+
+function Get-PolicyAction {
+    param([string]$ShortPolicy, [string]$WeeklyPolicy, [string[]]$RoleErrors = @())
+    if ($RoleErrors.Count -gt 0) { return 'UNKNOWN_WINDOW_ROLE' }
+    if ($WeeklyPolicy -eq 'STOP') { return 'WEEKLY_STOP' }
+    if ($ShortPolicy -eq 'EMERGENCY') { return 'SHORT_SUSPEND' }
+    if ($WeeklyPolicy -eq 'FINALIZE') { return 'WEEKLY_FINALIZE' }
+    if ($ShortPolicy -eq 'CRITICAL') { return 'SHORT_CRITICAL' }
+    if ($WeeklyPolicy -eq 'LOW') { return 'WEEKLY_LOW' }
+    if ($ShortPolicy -eq 'CONSERVE') { return 'SHORT_CONSERVE' }
+    if ($ShortPolicy -eq 'NORMAL' -and $WeeklyPolicy -eq 'HEALTHY') { return 'RUN' }
+    return 'UNKNOWN'
+}
+
+function Get-WindowRoles {
+    param($Windows)
+    $roles = [ordered]@{ short = $null; weekly = $null }
+    $errors = [System.Collections.ArrayList]::new()
+    foreach ($name in @('primary', 'secondary')) {
+        $role = [string](Get-Value (Get-Value $Windows $name) 'role')
+        if ([string]::IsNullOrWhiteSpace($role)) { continue }
+        if ($roles[$role]) { [void]$errors.Add("DUPLICATE_$($role.ToUpperInvariant())_WINDOW") }
+        elseif ($roles.Contains($role)) { $roles[$role] = $name }
+    }
+    foreach ($role in @('short', 'weekly')) { if (-not $roles[$role]) { [void]$errors.Add("MISSING_$($role.ToUpperInvariant())_WINDOW") } }
+    return [pscustomobject]@{ Roles = $roles; Errors = @($errors) }
+}
+
 function Get-ReasonCode {
     param([string]$Policy, [string]$Window)
     $prefix = if ($Window) { $Window.ToUpperInvariant() } else { 'EFFECTIVE' }
@@ -221,29 +288,47 @@ function Convert-UsageToState {
     if ($null -eq $rateLimits) { throw 'No Codex rate-limit object found.' }
     $primary = ConvertTo-Window (Get-Value $rateLimits 'primary') 'primary'
     $secondary = ConvertTo-Window (Get-Value $rateLimits 'secondary') 'secondary'
+    $windows = [ordered]@{ primary = $primary; secondary = $secondary }
     $valid = @($primary, $secondary) | Where-Object { $null -ne $_ }
     if ($valid.Count -eq 0) { throw 'No valid usage windows found.' }
     $culprit = $valid | Sort-Object { $_.remainingPercent } | Select-Object -First 1
     $effective = [double]$culprit.remainingPercent
-    $policy = Get-PolicyForRemaining $effective
+    $roleInfo = Get-WindowRoles $windows
+    $shortWindow = if ($roleInfo.Roles.short) { Get-Value $windows $roleInfo.Roles.short } else { $null }
+    $weeklyWindow = if ($roleInfo.Roles.weekly) { Get-Value $windows $roleInfo.Roles.weekly } else { $null }
+    $shortPolicy = if ($null -ne $shortWindow) { Get-PolicyForRemaining $shortWindow.remainingPercent } else { 'UNKNOWN' }
+    $weeklyPolicy = if ($null -ne $weeklyWindow) { Get-WeeklyPolicyForRemaining $weeklyWindow.remainingPercent } else { 'UNKNOWN' }
+    $policy = Get-CombinedPolicy $shortPolicy $weeklyPolicy (Get-PolicyForRemaining $effective)
+    $action = Get-PolicyAction $shortPolicy $weeklyPolicy $roleInfo.Errors
     $previousPolicy = [string](Get-Value $PreviousState 'currentPolicy')
     if ([string]::IsNullOrWhiteSpace($previousPolicy)) { $previousPolicy = 'UNKNOWN' }
+    $previousAction = [string](Get-Value $PreviousState 'policyAction')
+    if ([string]::IsNullOrWhiteSpace($previousAction)) { $previousAction = 'UNKNOWN' }
     $now = (Get-UtcNow).ToString('o')
     $oldChangedAt = Get-Value $PreviousState 'changedAt'
-    $changedAt = if ($previousPolicy -ne $policy -or $null -eq $oldChangedAt) { $now } else { $oldChangedAt }
+    $changedAt = if ($previousPolicy -ne $policy -or $previousAction -ne $action -or $null -eq $oldChangedAt) { $now } else { $oldChangedAt }
     return [ordered]@{
         schemaVersion = 2
         lastSuccessfulAt = $now
-        windows = [ordered]@{ primary = $primary; secondary = $secondary }
+        windows = $windows
+        windowRoles = $roleInfo.Roles
+        windowRoleErrors = $roleInfo.Errors
         previousPolicy = $previousPolicy
+        previousAction = $previousAction
         currentPolicy = $policy
+        shortPolicy = $shortPolicy
+        weeklyPolicy = $weeklyPolicy
+        policyAction = $action
         changedAt = $changedAt
-        reasonCode = Get-ReasonCode $policy ([string]$culprit.name)
+        reasonCode = if ($roleInfo.Errors.Count -gt 0) { [string]$roleInfo.Errors[0] } else { Get-ReasonCode $policy ([string]$culprit.name) }
         reasonWindow = [string]$culprit.name
+        reasonRole = [string](Get-Value $culprit 'role')
         evidence = [ordered]@{
             primaryRemaining = if ($null -ne $primary) { $primary.remainingPercent } else { $null }
             secondaryRemaining = if ($null -ne $secondary) { $secondary.remainingPercent } else { $null }
             effectiveRemaining = $effective
+            shortRemaining = if ($null -ne $shortWindow) { $shortWindow.remainingPercent } else { $null }
+            weeklyRemaining = if ($null -ne $weeklyWindow) { $weeklyWindow.remainingPercent } else { $null }
         }
         stale = $false
         consecutiveFailures = 0
@@ -260,6 +345,8 @@ function New-ResumePlan {
         $WakeAt = $null,
         $WaitSeconds = $null,
         $ScheduleKey = $null,
+        $CycleId = 0,
+        [string]$ResumeMode = 'continue',
         [string]$Status = 'NONE',
         $AutomationId = $null,
         $LastError = $null
@@ -271,6 +358,8 @@ function New-ResumePlan {
         wakeAt = $WakeAt
         waitSeconds = $WaitSeconds
         scheduleKey = $ScheduleKey
+        cycleId = $CycleId
+        resumeMode = $ResumeMode
         status = $Status
         automationId = $AutomationId
         lastError = $LastError
@@ -278,88 +367,63 @@ function New-ResumePlan {
     }
 }
 
+function Test-ActiveResumePlan {
+    param($Plan)
+    return [bool](Get-Value $Plan 'eligible') -and [string](Get-Value $Plan 'status') -in @('REQUESTED', 'SCHEDULED', 'FAILED')
+}
+
 function Get-ResumePlanForState {
-    param($State, $Event, $PreviousPlan, $Pause = $null)
-    $policy = [string](Get-Value $State 'currentPolicy')
-    $pauseCandidate = [bool](Get-Value $Pause 'pauseCandidate') -and
-        [bool](Get-Value $Pause 'checkpointObserved') -and
-        [string](Get-Value $Pause 'pauseReason') -eq 'usage_guard'
-    $pauseWindow = if ($pauseCandidate -and $policy -ne 'EMERGENCY') { [string](Get-Value $Pause 'pauseWindow') } else { '' }
-    if ((-not $pauseCandidate -and $policy -ne 'EMERGENCY') -or [bool](Get-Value $State 'stale')) {
-        return [pscustomobject]@{ Plan = (New-ResumePlan); RequestCreated = $false }
+    param($State, $Event, $PreviousPlan, $Pause = $null, $Continuation = $null)
+    $previous = if ($null -ne $PreviousPlan) { $PreviousPlan } else { New-ResumePlan }
+    $taskStatus = [string](Get-Value $Continuation 'taskStatus')
+    if ($taskStatus -in @('COMPLETED', 'CANCELLED', 'WAITING_USER', 'WEEKLY_STOPPED')) {
+        return [pscustomobject]@{ Plan = if (Test-ActiveResumePlan $previous) { New-ResumePlan -Status 'CANCELLED' } else { $previous }; RequestCreated = $false }
     }
+    $weekly = [string](Get-Value $State 'weeklyPolicy')
+    $short = [string](Get-Value $State 'shortPolicy')
+    $roleErrors = @(Get-Value $State 'windowRoleErrors')
+    if ($weekly -eq 'STOP') { return [pscustomobject]@{ Plan = (New-ResumePlan -Status 'WEEKLY_STOPPED' -ResumeMode 'finalize_only'); RequestCreated = $false } }
+    if ([bool](Get-Value $State 'stale')) { return [pscustomobject]@{ Plan = if (Test-ActiveResumePlan $previous) { $previous } else { New-ResumePlan }; RequestCreated = $false } }
+    if ($roleErrors.Count -gt 0) { return [pscustomobject]@{ Plan = if (Test-ActiveResumePlan $previous) { $previous } else { New-ResumePlan -Status 'SKIPPED_INVALID_WINDOW_ROLE' }; RequestCreated = $false } }
 
-    $blocking = [System.Collections.ArrayList]::new()
-    $resetValues = [System.Collections.ArrayList]::new()
+    $legacyPause = [bool](Get-Value $Pause 'pauseCandidate') -and [bool](Get-Value $Pause 'checkpointObserved') -and [string](Get-Value $Pause 'pauseReason') -eq 'usage_guard'
+    $pauseReason = if ($legacyPause) { 'short_window' } else { [string](Get-Value $Continuation 'pauseReason') }
+    if ($pauseReason -eq 'weekly_budget') { return [pscustomobject]@{ Plan = (New-ResumePlan -Status $(if ($weekly -eq 'STOP') { 'WEEKLY_STOPPED' } else { 'WEEKLY_FINALIZE' }) -ResumeMode 'finalize_only'); RequestCreated = $false } }
+    $shortPause = $pauseReason -in @('short_window', 'plugin_pause') -or $legacyPause
+    $shouldSchedule = $short -eq 'EMERGENCY' -or $shortPause
+    if ($weekly -eq 'FINALIZE' -and -not $shouldSchedule) { return [pscustomobject]@{ Plan = (New-ResumePlan -Status 'WEEKLY_FINALIZE' -ResumeMode 'finalize_only'); RequestCreated = $false } }
+    if (-not $shouldSchedule) { return [pscustomobject]@{ Plan = if (Test-ActiveResumePlan $previous) { $previous } else { New-ResumePlan }; RequestCreated = $false } }
+
     $windows = Get-Value $State 'windows'
-    foreach ($name in @('primary', 'secondary')) {
-        $window = Get-Value $windows $name
-        if ($pauseWindow -and $name -eq $pauseWindow) {
-            [void]$blocking.Add($name)
-            $reset = ConvertTo-Number (Get-Value $Pause 'pauseResetAt')
-            if ($null -eq $reset) { $reset = ConvertTo-Number (Get-Value $window 'resetsAt') }
-            if ($null -eq $reset) {
-                return [pscustomobject]@{
-                    Plan = (New-ResumePlan -BlockingWindows @($blocking) -Status 'SKIPPED_INVALID_RESET')
-                    RequestCreated = $false
-                }
-            }
-            [void]$resetValues.Add([long][Math]::Floor($reset))
-            continue
-        }
-        $remaining = ConvertTo-Number (Get-Value $window 'remainingPercent')
-        if ($null -ne $remaining -and $remaining -lt 8) {
-            [void]$blocking.Add($name)
-            $reset = ConvertTo-Number (Get-Value $window 'resetsAt')
-            if ($null -eq $reset) {
-                return [pscustomobject]@{
-                    Plan = (New-ResumePlan -BlockingWindows @($blocking) -Status 'SKIPPED_INVALID_RESET')
-                    RequestCreated = $false
-                }
-            }
-            [void]$resetValues.Add([long][Math]::Floor($reset))
-        }
-    }
-
-    if ($blocking.Count -eq 0) {
-        return [pscustomobject]@{ Plan = (New-ResumePlan); RequestCreated = $false }
-    }
-
-    $now = Get-UtcNow
-    $nowUnix = $now.ToUnixTimeSeconds()
-    $blockingResetAt = [long](($resetValues | Measure-Object -Maximum).Maximum)
+    $roles = Get-Value $State 'windowRoles'
+    $shortName = [string](Get-Value $Pause 'pauseWindow')
+    if ([string]::IsNullOrWhiteSpace($shortName)) { $shortName = [string](Get-Value $Continuation 'pauseWindow') }
+    if ([string]::IsNullOrWhiteSpace($shortName)) { $shortName = [string](Get-Value $roles 'short') }
+    $shortWindow = Get-Value $windows $shortName
+    if ([string]::IsNullOrWhiteSpace($shortName) -or $null -eq $shortWindow) { return [pscustomobject]@{ Plan = New-ResumePlan -Status 'SKIPPED_INVALID_WINDOW_ROLE'; RequestCreated = $false } }
+    $blocking = @($shortName)
+    $reset = ConvertTo-Number (Get-Value $Pause 'pauseResetAt')
+    if ($null -eq $reset) { $reset = ConvertTo-Number (Get-Value $Continuation 'pauseResetAt') }
+    if ($null -eq $reset) { $reset = ConvertTo-Number (Get-Value $shortWindow 'resetsAt') }
+    if ($null -eq $reset) { return [pscustomobject]@{ Plan = New-ResumePlan -BlockingWindows $blocking -Status 'SKIPPED_INVALID_RESET'; RequestCreated = $false } }
+    $nowUnix = (Get-UtcNow).ToUnixTimeSeconds()
+    $blockingResetAt = [long][Math]::Floor($reset)
     $wakeAt = $blockingResetAt + $script:ResumeSafetySeconds
     $waitSeconds = $wakeAt - $nowUnix
-    if ($blockingResetAt -le $nowUnix -or $waitSeconds -le 0) {
-        return [pscustomobject]@{
-            Plan = (New-ResumePlan -BlockingWindows @($blocking) -BlockingResetAt $blockingResetAt -WakeAt $wakeAt -WaitSeconds $waitSeconds -Status 'SKIPPED_INVALID_RESET')
-            RequestCreated = $false
-        }
-    }
-
+    if ($blockingResetAt -le $nowUnix -or $waitSeconds -le 0) { return [pscustomobject]@{ Plan = New-ResumePlan -BlockingWindows $blocking -BlockingResetAt $blockingResetAt -WakeAt $wakeAt -WaitSeconds $waitSeconds -Status 'SKIPPED_INVALID_RESET'; RequestCreated = $false } }
+    $previousKey = [string](Get-Value $previous 'scheduleKey')
+    $sameWindowAndWake = -not [string]::IsNullOrWhiteSpace($previousKey) -and (ConvertTo-Number (Get-Value $previous 'wakeAt')) -eq $wakeAt -and ((@((Get-Value $previous 'blockingWindows')) -join ',') -eq ($blocking -join ','))
+    $cycleId = if ($sameWindowAndWake) { [int](ConvertTo-Number (Get-Value $previous 'cycleId')) } else { [int]([Math]::Max((ConvertTo-Number (Get-Value $previous 'cycleId')), (ConvertTo-Number (Get-Value $Continuation 'cycleId'))) + 1) }
+    if ($cycleId -le 0) { $cycleId = 1 }
     $sessionId = ConvertTo-SafeId ([string](Get-Value $Event 'session_id'))
-    $windowKey = (@($blocking) -join '+')
-    $scheduleKey = "${sessionId}:${windowKey}:${wakeAt}"
-    if ($waitSeconds -gt $script:ResumeMaxWaitSeconds) {
-        return [pscustomobject]@{
-            Plan = (New-ResumePlan -BlockingWindows @($blocking) -BlockingResetAt $blockingResetAt -WakeAt $wakeAt -WaitSeconds $waitSeconds -ScheduleKey $scheduleKey -Status 'SKIPPED_LONG_WAIT')
-            RequestCreated = $false
-        }
+    $scheduleKey = if ($sameWindowAndWake) { $previousKey } else { "${sessionId}:$($blocking -join '+'):${wakeAt}:c$cycleId" }
+    $resumeMode = if ($weekly -eq 'FINALIZE') { 'finalize_only' } elseif (Get-Value $Continuation 'resumeMode') { [string](Get-Value $Continuation 'resumeMode') } else { 'continue' }
+    if ($waitSeconds -gt $script:ResumeMaxWaitSeconds) { return [pscustomobject]@{ Plan = New-ResumePlan -BlockingWindows $blocking -BlockingResetAt $blockingResetAt -WakeAt $wakeAt -WaitSeconds $waitSeconds -ScheduleKey $scheduleKey -CycleId $cycleId -ResumeMode $resumeMode -Status 'SKIPPED_LONG_WAIT'; RequestCreated = $false } }
+    $previousStatus = [string](Get-Value $previous 'status')
+    if ($sameWindowAndWake -and $previousStatus -in @('REQUESTED', 'SCHEDULED', 'FAILED')) {
+        return [pscustomobject]@{ Plan = New-ResumePlan -Eligible $true -BlockingWindows $blocking -BlockingResetAt $blockingResetAt -WakeAt $wakeAt -WaitSeconds $waitSeconds -ScheduleKey $scheduleKey -CycleId $cycleId -ResumeMode $resumeMode -Status $previousStatus -AutomationId (Get-Value $previous 'automationId') -LastError (Get-Value $previous 'lastError'); RequestCreated = $false }
     }
-
-    $previousKey = [string](Get-Value $PreviousPlan 'scheduleKey')
-    $previousStatus = [string](Get-Value $PreviousPlan 'status')
-    if ($previousKey -eq $scheduleKey -and $previousStatus -in @('REQUESTED', 'SCHEDULED', 'FAILED')) {
-        return [pscustomobject]@{
-            Plan = (New-ResumePlan -Eligible $true -BlockingWindows @($blocking) -BlockingResetAt $blockingResetAt -WakeAt $wakeAt -WaitSeconds $waitSeconds -ScheduleKey $scheduleKey -Status $previousStatus -AutomationId (Get-Value $PreviousPlan 'automationId') -LastError (Get-Value $PreviousPlan 'lastError'))
-            RequestCreated = $false
-        }
-    }
-
-    return [pscustomobject]@{
-        Plan = (New-ResumePlan -Eligible $true -BlockingWindows @($blocking) -BlockingResetAt $blockingResetAt -WakeAt $wakeAt -WaitSeconds $waitSeconds -ScheduleKey $scheduleKey -Status 'REQUESTED')
-        RequestCreated = $true
-    }
+    return [pscustomobject]@{ Plan = New-ResumePlan -Eligible $true -BlockingWindows $blocking -BlockingResetAt $blockingResetAt -WakeAt $wakeAt -WaitSeconds $waitSeconds -ScheduleKey $scheduleKey -CycleId $cycleId -ResumeMode $resumeMode -Status 'REQUESTED'; RequestCreated = $true }
 }
 
 function Get-ResumeAutomationRrule {
@@ -380,7 +444,7 @@ function Get-ResumeAutomationInput {
         kind = 'heartbeat'
         destination = 'thread'
         name = 'Usage Guard resume'
-        prompt = "Usage Guard recovery scheduleKey=$key. Refresh Usage Guard when this heartbeat runs. Continue from the existing checkpoint only after usage leaves EMERGENCY, obey the current policy, stay quiet if still blocked, and pause this heartbeat after its recovery run."
+        prompt = "Usage Guard recovery scheduleKey=$key cycleId=$([string](Get-Value $Plan 'cycleId')) resumeMode=$([string](Get-Value $Plan 'resumeMode')). Refresh Usage Guard when this heartbeat runs. Continue from the existing checkpoint only after the short window has reset and the weekly policy permits it; obey the current policy, stay quiet if still blocked, and pause this heartbeat after its recovery run."
         rrule = $rrule
         status = 'ACTIVE'
     }
@@ -394,6 +458,9 @@ function Get-ResumePlanContext {
     $wakeAt = ConvertTo-Number (Get-Value $plan 'wakeAt')
     $wakeIso = if ($null -ne $wakeAt) { [DateTimeOffset]::FromUnixTimeSeconds([long]$wakeAt).ToString('o') } else { 'unknown' }
     $key = [string](Get-Value $plan 'scheduleKey')
+    if ($status -eq 'CONSUMED') { return '' }
+    if ($status -eq 'WEEKLY_STOPPED') { return ' Weekly quota is below 5%; no heartbeat will be created. Finish the final handoff and wait for the weekly reset.' }
+    if ($status -eq 'WEEKLY_FINALIZE') { return ' Weekly quota is in finalization range; finish the current coherent unit and leave a complete handoff. Do not wait on a short-window heartbeat.' }
     if ($status -eq 'SKIPPED_LONG_WAIT') {
         return " Auto-resume skipped because wakeAt=$wakeIso is more than six hours away. Save a bounded checkpoint and report manual resume timing."
     }
@@ -499,7 +566,11 @@ function Register-UsageFailure {
     }
     else {
         $State.previousPolicy = Get-Value $State 'currentPolicy'
+        $State.previousAction = Get-Value $State 'policyAction'
         $State.currentPolicy = 'UNKNOWN'
+        $State.shortPolicy = 'UNKNOWN'
+        $State.weeklyPolicy = 'UNKNOWN'
+        $State.policyAction = 'UNKNOWN'
         $State.reasonCode = 'QUERY_FAILED_NO_CACHE'
         $State.reasonWindow = $null
         $State.stale = $false
@@ -515,7 +586,15 @@ function Get-PolicySummary {
     $reason = [string](Get-Value $State 'reasonCode')
     $evidence = Get-Value $State 'evidence'
     $effective = Get-Value $evidence 'effectiveRemaining'
+    $action = [string](Get-Value $State 'policyAction')
+    $short = Get-Value $evidence 'shortRemaining'
+    $weekly = Get-Value $evidence 'weeklyRemaining'
     $suffix = if ($null -ne $effective) { " remaining=$effective%" } else { '' }
+    if ($null -ne $short -and $null -ne $weekly) { $suffix += " short=$short% weekly=$weekly%" }
+    $shortPolicy = [string](Get-Value $State 'shortPolicy')
+    $weeklyPolicy = [string](Get-Value $State 'weeklyPolicy')
+    if ($shortPolicy -and $weeklyPolicy -and $shortPolicy -ne 'UNKNOWN' -and $weeklyPolicy -ne 'UNKNOWN') { $suffix += " shortPolicy=$shortPolicy weeklyPolicy=$weeklyPolicy" }
+    if ($action -and $action -ne 'UNKNOWN') { $suffix += " action=$action" }
     if ([bool](Get-Value $State 'stale')) { $suffix += ' STALE' }
     return "state=$policy reason=$reason$suffix"
 }
@@ -605,6 +684,7 @@ function New-TurnRecord {
         usageAttempted = $false
         usageChecked = $false
         effectivePolicy = 'UNKNOWN'
+        policyAction = 'UNKNOWN'
         overrideOnce = Test-OverridePrompt ([string](Get-Value $Event 'prompt'))
         stopContinuationRequested = $false
         resumeScheduleAttempted = $false
@@ -615,6 +695,9 @@ function New-TurnRecord {
         pausePolicy = $null
         pauseCandidateAt = $null
         checkpointObserved = $false
+        checkpointPath = $null
+        checkpointRevision = $null
+        checkpointRequestIssued = $false
         pauseWindow = $null
         pauseResetAt = $null
     }
@@ -630,6 +713,51 @@ function Save-TurnRecord {
     Write-JsonAtomic (Get-TurnPath ([string](Get-Value $Event 'session_id')) ([string](Get-Value $Event 'turn_id'))) $Record
 }
 
+function Get-CheckpointMarker {
+    param($Event)
+    $root = if (-not [string]::IsNullOrWhiteSpace([string](Get-Value $Event 'cwd'))) { [System.IO.Path]::GetFullPath([string](Get-Value $Event 'cwd')) } else { (Get-Location).Path }
+    $markerPath = [System.IO.Path]::Combine($root, $script:CheckpointRelativePath)
+    if (-not [System.IO.File]::Exists($markerPath)) { return $null }
+    try { $marker = (Read-JsonFile $markerPath) } catch { return $null }
+    if ($null -eq $marker -or [string](Get-Value $marker 'sessionId') -ne [string](Get-Value $Event 'session_id')) { return $null }
+    $status = [string](Get-Value $marker 'taskStatus')
+    if ($status -notin @('RUNNING', 'PAUSED_QUOTA', 'COMPLETED', 'CANCELLED', 'WAITING_USER', 'WEEKLY_STOPPED')) { return $null }
+    $checkpointPath = [string](Get-Value $marker 'checkpointPath')
+    $planRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($root, 'docs', 'plan'))
+    $resolved = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($root, $checkpointPath))
+    $relative = [System.IO.Path]::GetRelativePath($planRoot, $resolved)
+    if ([string]::IsNullOrWhiteSpace($checkpointPath) -or $relative.StartsWith('..') -or [System.IO.Path]::IsPathRooted($relative) -or -not [System.IO.File]::Exists($resolved)) { return $null }
+    $revision = [string](Get-Value $marker 'revision')
+    if ([string]::IsNullOrWhiteSpace($revision)) { $revision = [string](Get-Value $marker 'checkpointRevision') }
+    if ([string]::IsNullOrWhiteSpace($revision)) { return $null }
+    if ($status -eq 'PAUSED_QUOTA' -and ([string](Get-Value $marker 'pauseReason') -notin @('short_window', 'weekly_budget', 'plugin_pause') -or [string]::IsNullOrWhiteSpace([string](Get-Value $marker 'nextStep')))) { return $null }
+    return [pscustomobject]@{ Marker = $marker; CheckpointPath = $checkpointPath; Revision = $revision }
+}
+
+function Invoke-CheckpointPostTool {
+    param($Event)
+    if ((Get-Value (Get-Value $Event 'tool_response') 'isError') -eq $true) { return @{} }
+    $verified = Get-CheckpointMarker $Event
+    if ($null -eq $verified) { return @{} }
+    $turn = Get-TurnRecord $Event
+    if ($null -eq $turn) { $turn = New-TurnRecord $Event }
+    $marker = $verified.Marker
+    $status = [string](Get-Value $marker 'taskStatus')
+    $turn.checkpointObserved = $true
+    $turn.checkpointRequestIssued = $true
+    $turn.checkpointPath = $verified.CheckpointPath
+    $turn.checkpointRevision = $verified.Revision
+    if ($status -eq 'PAUSED_QUOTA') {
+        $turn.pauseCandidate = $true
+        $turn.pauseReason = 'usage_guard'
+        $turn.pauseWindow = [string](Get-Value $marker 'pauseWindow')
+        if ([string]::IsNullOrWhiteSpace($turn.pauseWindow)) { $turn.pauseWindow = if ([string](Get-Value $marker 'pauseReason') -eq 'weekly_budget') { [string](Get-Value (Get-Value (Get-State) 'windowRoles') 'weekly') } else { [string](Get-Value (Get-Value (Get-State) 'windowRoles') 'short') } }
+        $turn.pauseResetAt = ConvertTo-Number (Get-Value $marker 'pauseResetAt')
+    }
+    Save-TurnRecord $Event $turn
+    return New-ContextOutput 'PostToolUse' 'Usage Guard checkpoint registered; continuation state is durable.'
+}
+
 function Update-UsageSnapshot {
     param($Event, $Turn = $null)
     $state = Get-State
@@ -640,11 +768,12 @@ function Update-UsageSnapshot {
         $previousPlan = Get-Value $state 'resumePlan'
         $state = Convert-UsageToState (Invoke-RateLimitQuery) $state
         $classification = Get-ToolClassification $Event
-        $pause = if ($classification.Kind -eq 'resume-automation' -and $Turn.pauseCandidate -and $Turn.checkpointObserved) { $Turn } else { $null }
-        $resume = Get-ResumePlanForState $state $Event $previousPlan $pause
+        $pause = if ($Turn.pauseCandidate -and $Turn.checkpointObserved) { $Turn } else { $null }
+        $resume = if ($null -ne $pause -or $classification.Kind -eq 'resume-automation') { Get-ResumePlanForState $state $Event $previousPlan $pause } else { [pscustomobject]@{ Plan = $previousPlan; RequestCreated = $false } }
         $state.resumePlan = $resume.Plan
         $Turn.usageChecked = $true
         $Turn.effectivePolicy = $state.currentPolicy
+        $Turn.policyAction = $state.policyAction
         Write-JsonAtomic (Get-StatePath) $state
         Save-TurnRecord $Event $Turn
         return [pscustomobject]@{ Succeeded = $true; State = $state; Turn = $Turn; Error = $null; ResumeRequestCreated = $resume.RequestCreated }
@@ -654,6 +783,7 @@ function Update-UsageSnapshot {
         $state = Register-UsageFailure $state
         $Turn.usageChecked = $false
         $Turn.effectivePolicy = $state.currentPolicy
+        $Turn.policyAction = $state.policyAction
         Write-JsonAtomic (Get-StatePath) $state
         Save-TurnRecord $Event $Turn
         return [pscustomobject]@{ Succeeded = $false; State = $state; Turn = $Turn; Error = $_.Exception.Message; ResumeRequestCreated = $false }
@@ -661,53 +791,44 @@ function Update-UsageSnapshot {
 }
 
 function Update-PauseCandidate {
-    param($Turn, $State, $Classification, [string]$Policy)
+    param($Turn, $State, $Classification, [string]$Policy, $Continuation = $null)
     if ($null -eq $Turn -or $Classification.Kind -eq 'resume-automation') { return $false }
-    $changed = $false
-    if ($Turn.pauseCandidate -and $Turn.checkpointObserved -and -not $Classification.CheckpointSafe) {
-        $Turn.pauseCandidate = $false
-        $Turn.pauseReason = $null
-        $Turn.pausePolicy = $null
-        $Turn.pauseCandidateAt = $null
-        $Turn.checkpointObserved = $false
-        $Turn.pauseWindow = $null
-        $Turn.pauseResetAt = $null
-        $changed = $true
-    }
-    if ($Policy -eq 'CRITICAL' -or $Policy -eq 'EMERGENCY') {
-        if (-not $Turn.pauseCandidate) {
-            $windows = Get-Value $State 'windows'
-            $reasonWindow = [string](Get-Value $State 'reasonWindow')
-            $candidateWindow = @('primary', 'secondary') | Where-Object { $_ -eq $reasonWindow -and $null -ne (Get-Value $windows $_) } | Select-Object -First 1
-            if (-not $candidateWindow) {
-                $candidateWindow = @('primary', 'secondary') | Where-Object {
-                    $remaining = ConvertTo-Number (Get-Value (Get-Value $windows $_) 'remainingPercent')
-                    $null -ne $remaining -and $remaining -lt 15
-                } | Select-Object -First 1
-            }
-            $Turn.pauseCandidate = $true
-            $Turn.pauseReason = 'usage_guard'
-            $Turn.pausePolicy = $Policy
-            $Turn.pauseCandidateAt = (Get-UtcNow).ToString('o')
-            $Turn.pauseWindow = if ($candidateWindow) { [string]$candidateWindow } else { $null }
-            $Turn.pauseResetAt = if ($candidateWindow) { ConvertTo-Number (Get-Value (Get-Value $windows $candidateWindow) 'resetsAt') } else { $null }
-            $changed = $true
-        }
-        if ($Classification.CheckpointSafe -and -not $Turn.checkpointObserved) {
-            $Turn.checkpointObserved = $true
-            $changed = $true
-        }
-    }
-    elseif ($Turn.pauseCandidate -and $Classification.CheckpointSafe -and -not $Turn.checkpointObserved) {
-        $Turn.checkpointObserved = $true
-        $changed = $true
-    }
-    return $changed
+    if ([string](Get-Value $Continuation 'taskStatus') -in @('PAUSED_QUOTA', 'COMPLETED', 'CANCELLED', 'WAITING_USER', 'WEEKLY_STOPPED')) { return $false }
+    $action = [string](Get-Value $State 'policyAction')
+    if ([string]::IsNullOrWhiteSpace($action)) { $action = @{ EMERGENCY = 'SHORT_SUSPEND'; CRITICAL = 'SHORT_CRITICAL' }[$Policy] }
+    if ($action -notin @('SHORT_CRITICAL', 'SHORT_SUSPEND', 'WEEKLY_FINALIZE', 'WEEKLY_STOP')) { return $false }
+    if ([bool]$Turn.pauseCandidate) { return $false }
+    $windows = Get-Value $State 'windows'
+    $roles = Get-Value $State 'windowRoles'
+    $role = if ($action.StartsWith('WEEKLY')) { 'weekly' } else { 'short' }
+    $candidateWindow = [string](Get-Value $roles $role)
+    $candidate = Get-Value $windows $candidateWindow
+    $Turn.pauseCandidate = $true
+    $Turn.pauseReason = 'usage_guard'
+    $Turn.pausePolicy = $Policy
+    $Turn.pauseCandidateAt = (Get-UtcNow).ToString('o')
+    $Turn.pauseWindow = if ($candidateWindow) { $candidateWindow } else { $null }
+    $Turn.pauseResetAt = ConvertTo-Number (Get-Value $candidate 'resetsAt')
+    $Turn.checkpointObserved = $false
+    return $true
+}
+
+function Get-CheckpointHint {
+    param($Event, $State, $Continuation = $null)
+    $action = [string](Get-Value $State 'policyAction')
+    if ($action -notin @('SHORT_CRITICAL', 'SHORT_SUSPEND', 'WEEKLY_FINALIZE', 'WEEKLY_STOP')) { return '' }
+    if ([string](Get-Value $Continuation 'taskStatus') -eq 'PAUSED_QUOTA') { return '' }
+    $reason = if ($action.StartsWith('WEEKLY')) { 'weekly_budget' } else { 'short_window' }
+    $weekly = [string](Get-Value $State 'weeklyPolicy')
+    $mode = if ($action.StartsWith('WEEKLY') -or $weekly -eq 'FINALIZE') { 'finalize_only' } else { 'continue' }
+    $sessionId = [string](Get-Value $Event 'session_id')
+    $pathText = $script:CheckpointRelativePath -replace '\\', '/'
+    return " If this turn must pause, write $pathText with JSON containing sessionId '$sessionId', taskStatus 'PAUSED_QUOTA', pauseReason '$reason', checkpointPath 'docs/plan/progress.md', revision '<new non-empty revision>', resumeMode '$mode', and nextStep '<one bounded next step>'; let the post-tool hook register it before stopping."
 }
 
 function Test-MatchingResumeAutomation {
-    param($Event, $State)
-    $plan = Get-Value $State 'resumePlan'
+    param($Event, $State, $Plan = $null)
+    $plan = if ($null -ne $Plan) { $Plan } else { Get-Value $State 'resumePlan' }
     if (-not [bool](Get-Value $plan 'eligible')) { return $false }
     $expected = Get-ResumeAutomationInput $plan
     $input = Get-Value $Event 'tool_input'
@@ -745,40 +866,60 @@ function Invoke-PreToolPolicy {
     $state = $refresh.State
     $policy = [string](Get-Value $state 'currentPolicy')
     if ([string]::IsNullOrWhiteSpace($policy)) { $policy = 'UNKNOWN' }
+    $action = [string](Get-Value $state 'policyAction')
+    if ([string]::IsNullOrWhiteSpace($action)) { $action = 'UNKNOWN' }
     if ($override) {
         return New-ContextOutput 'PreToolUse' "Usage Guard one-turn override is active. Continue deliberately; usage warnings still apply. $((Get-PolicySummary $state))"
     }
     if (Update-PauseCandidate $turn $state $classification $policy) { Save-TurnRecord $Event $turn }
     if ($classification.Kind -eq 'resume-automation') {
         $plan = Get-Value $state 'resumePlan'
-        $planned = [bool](Get-Value $plan 'eligible') -and [string](Get-Value $plan 'status') -in @('REQUESTED', 'SCHEDULED', 'FAILED')
-        if ($policy -ne 'EMERGENCY' -and -not $planned) { return @{} }
-        if (-not (Test-MatchingResumeAutomation $Event $state)) {
-            return New-DenyOutput 'Usage Guard EMERGENCY permits only the heartbeat matching the current recovery schedule key.'
+        $planned = Test-ActiveResumePlan $plan
+        if ($action -eq 'WEEKLY_STOP') { return New-DenyOutput 'Usage Guard weekly quota stop disables recovery heartbeats.' }
+        if ($action -ne 'SHORT_SUSPEND' -and -not $planned) { return @{} }
+        if (-not (Test-MatchingResumeAutomation $Event $state $plan)) {
+            return New-DenyOutput 'Usage Guard permits only the heartbeat matching the current recovery schedule key.'
         }
         $turn.resumeScheduleAttempted = $true
-        $turn.resumeScheduleKey = Get-Value (Get-Value $state 'resumePlan') 'scheduleKey'
+        $turn.resumeScheduleKey = Get-Value $plan 'scheduleKey'
         Save-TurnRecord $Event $turn
         return New-ContextOutput 'PreToolUse' 'Usage Guard permits this matching bounded auto-resume heartbeat operation.'
     }
-    if ($policy -eq 'UNKNOWN') {
+    if ($policy -eq 'UNKNOWN' -or $action -in @('UNKNOWN', 'UNKNOWN_WINDOW_ROLE')) {
         return New-ContextOutput 'PreToolUse' 'Usage state is UNKNOWN; fail-open is active. Continue cautiously and preserve a checkpoint after repeated failures.' 'Usage Guard could not read quota and is failing open.'
     }
-    switch ($policy) {
-        'NORMAL' { return @{} }
-        'CONSERVE' {
+    if ($action -eq 'RUN' -or $policy -eq 'NORMAL') { return @{} }
+    switch ($action) {
+        'SHORT_CONSERVE' {
             if ($classification.Kind -eq 'expansion') { return New-DenyOutput 'Usage Guard CONSERVE blocks new subagents and generated-media expansion.' }
             return New-ContextOutput 'PreToolUse' "Usage Guard CONSERVE: $((Get-PolicySummary $state)). Keep scope narrow."
         }
-        'CRITICAL' {
+        'WEEKLY_LOW' {
+            if ($classification.Kind -eq 'expansion') { return New-DenyOutput 'Usage Guard WEEKLY_LOW blocks new scope and expansion.' }
+            return New-ContextOutput 'PreToolUse' "Usage Guard WEEKLY_LOW: finish the current coherent unit and prepare a complete handoff. $((Get-PolicySummary $state))"
+        }
+        'WEEKLY_STOP' {
+            if (-not $classification.CheckpointSafe) { return New-DenyOutput "Usage Guard WEEKLY_STOP allows only a final bounded checkpoint: $((Get-PolicySummary $state))." }
+            return New-ContextOutput 'PreToolUse' "Usage Guard WEEKLY_STOP: write the complete handoff and stop; $((Get-PolicySummary $state)).$(Get-CheckpointHint $Event $state $null)"
+        }
+        'WEEKLY_FINALIZE' {
+            if ($classification.Cost -eq 'HIGH' -or $classification.Kind -eq 'expansion') { return New-DenyOutput "Usage Guard WEEKLY_FINALIZE blocks expansion: $((Get-PolicySummary $state))." }
+            return New-ContextOutput 'PreToolUse' "Usage Guard WEEKLY_FINALIZE: finish only the current coherent unit and write a complete handoff; $((Get-PolicySummary $state)).$(Get-CheckpointHint $Event $state $null)"
+        }
+        'SHORT_CRITICAL' {
             if ($classification.Cost -eq 'HIGH') { return New-DenyOutput "Usage Guard CRITICAL blocks high-cost work: $((Get-PolicySummary $state))." }
-            return New-ContextOutput 'PreToolUse' "Usage Guard CRITICAL: finish only the smallest necessary step; $((Get-PolicySummary $state))."
+            return New-ContextOutput 'PreToolUse' "Usage Guard CRITICAL: finish only the smallest necessary step; $((Get-PolicySummary $state)).$(Get-CheckpointHint $Event $state $null)"
         }
-        'EMERGENCY' {
+        'SHORT_SUSPEND' {
             if (-not $classification.CheckpointSafe) { return New-DenyOutput "Usage Guard EMERGENCY allows only bounded checkpoint, status, and reporting operations: $((Get-PolicySummary $state))." }
-            return New-ContextOutput 'PreToolUse' 'Usage Guard EMERGENCY: this bounded checkpoint operation is allowed; do not expand its scope.'
+            return New-ContextOutput 'PreToolUse' "Usage Guard EMERGENCY: this bounded checkpoint operation is allowed; do not expand its scope.$(Get-CheckpointHint $Event $state $null)"
         }
-        default { return @{} }
+        default {
+            if ($policy -eq 'CONSERVE') { return New-ContextOutput 'PreToolUse' "Usage Guard CONSERVE: $((Get-PolicySummary $state)). Keep scope narrow." }
+            if ($policy -eq 'CRITICAL') { return New-ContextOutput 'PreToolUse' "Usage Guard CRITICAL: finish only the smallest necessary step; $((Get-PolicySummary $state))." }
+            if ($policy -eq 'EMERGENCY') { return New-ContextOutput 'PreToolUse' "Usage Guard EMERGENCY: this bounded checkpoint operation is allowed; do not expand its scope." }
+            return @{}
+        }
     }
 }
 
@@ -919,7 +1060,8 @@ function Invoke-HookEvent {
         'PostToolUse' {
             $toolName = [string](Get-Value $Event 'tool_name')
             if ($toolName -eq $script:AutomationToolName) { return Invoke-AutomationPostTool $Event }
-            return Invoke-UsagePostTool $Event
+            if ($toolName -eq $script:UsageToolName) { return Invoke-UsagePostTool $Event }
+            return Invoke-CheckpointPostTool $Event
         }
         'SubagentStart' {
             $state = Get-State
@@ -932,8 +1074,21 @@ function Invoke-HookEvent {
             $state = Get-State
             $plan = Get-Value $state 'resumePlan'
             $turn = Get-TurnRecord $Event
+            if ([string](Get-Value $state 'policyAction') -eq 'WEEKLY_STOP' -and $null -ne $turn -and [bool](Get-Value $turn 'checkpointObserved')) {
+                $plan = New-ResumePlan -Status 'WEEKLY_STOPPED' -ResumeMode 'finalize_only'
+                $state.resumePlan = $plan
+                Write-JsonAtomic (Get-StatePath) $state
+                return @{}
+            }
+            $confirmed = $null -ne $turn -and [bool](Get-Value $turn 'checkpointObserved') -and -not [string]::IsNullOrWhiteSpace([string](Get-Value $turn 'checkpointRevision'))
+            if ($null -ne $turn -and [bool](Get-Value $turn 'pauseCandidate') -and -not $confirmed -and -not [bool](Get-Value $turn 'checkpointRequestIssued')) {
+                $turn.checkpointRequestIssued = $true
+                Save-TurnRecord $Event $turn
+                $pathText = $script:CheckpointRelativePath -replace '\\', '/'
+                return [ordered]@{ decision = 'block'; reason = "Usage Guard pause requires one verified checkpoint marker at $pathText; write it with the required sessionId/taskStatus/pauseReason/checkpointPath/revision/nextStep fields, then let PostToolUse register it." }
+            }
             $requested = [bool](Get-Value $plan 'eligible') -and [string](Get-Value $plan 'status') -eq 'REQUESTED'
-            if (-not $requested -and $null -ne $turn -and [bool](Get-Value $turn 'pauseCandidate') -and [bool](Get-Value $turn 'checkpointObserved')) {
+            if (-not $requested -and $confirmed) {
                 $resume = Get-ResumePlanForState $state $Event $plan $turn
                 $state.resumePlan = $resume.Plan
                 $plan = $resume.Plan

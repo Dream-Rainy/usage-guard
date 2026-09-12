@@ -58,6 +58,7 @@ function New-Event {
         tool_response = $null
         stop_hook_active = $false
         prompt = 'Fix the issue'
+        cwd = (Get-Location).Path
     }
 }
 
@@ -181,12 +182,31 @@ try {
     $pauseNow = [DateTimeOffset]::Parse($env:USAGE_GUARD_NOW_UTC).ToUnixTimeSeconds()
     $pauseReset = $pauseNow + 1800
     Set-MockUsage 86 20 $pauseReset ($pauseNow + 50000)
+    $checkpointRoot = Join-Path $testRoot 'checkpoint-workspace'
+    New-Item -ItemType Directory -Force -Path (Join-Path $checkpointRoot 'docs\plan') | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $checkpointRoot 'docs\plan\progress.md'), 'bounded checkpoint')
     $pauseEvent = New-Event 'PreToolUse' 'exec' 'text(await tools.apply_patch("*** Update File: docs/plan/progress.md"))'
     $pauseEvent.turn_id = 'pause-turn'
+    $pauseEvent.cwd = $checkpointRoot
     $pauseContext = Invoke-PreToolPolicy $pauseEvent
     Assert-True ($pauseContext.hookSpecificOutput.additionalContext -match 'CRITICAL') 'critical checkpoint warning is emitted'
     $pauseRecord = Get-TurnRecord $pauseEvent
-    Assert-True ([bool]$pauseRecord.pauseCandidate -and $pauseRecord.pauseReason -eq 'usage_guard' -and [bool]$pauseRecord.checkpointObserved) 'critical checkpoint records a pause candidate'
+    Assert-True ([bool]$pauseRecord.pauseCandidate -and $pauseRecord.pauseReason -eq 'usage_guard' -and -not [bool]$pauseRecord.checkpointObserved) 'critical checkpoint records a pause candidate'
+    $marker = [ordered]@{
+        sessionId = $pauseEvent.session_id
+        taskStatus = 'PAUSED_QUOTA'
+        pauseReason = 'short_window'
+        checkpointPath = 'docs/plan/progress.md'
+        revision = 'pause-r1'
+        resumeMode = 'continue'
+        nextStep = 'resume the current coherent unit'
+    }
+    Write-JsonAtomic (Join-Path $checkpointRoot $script:CheckpointRelativePath) $marker
+    $checkpointPost = $pauseEvent | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+    $checkpointPost.hook_event_name = 'PostToolUse'
+    $checkpointPost.tool_response = [pscustomobject]@{ isError = $false }
+    $null = Invoke-HookEvent $checkpointPost
+    Assert-True ([bool](Get-TurnRecord $pauseEvent).checkpointObserved) 'verified checkpoint is registered after PostToolUse'
     $recovered = Convert-UsageToState (New-UsageResponse 10 20 $pauseReset ($pauseNow + 50000)) (Get-State)
     Write-JsonAtomic (Get-StatePath) $recovered
     $pauseStop = New-Event 'Stop'
@@ -217,8 +237,9 @@ try {
     $secondaryReset = $nowUnix + 2000
     $bothState = Convert-UsageToState (New-UsageResponse 95 94 $primaryReset $secondaryReset) (New-DefaultState)
     $bothPlan = (Get-ResumePlanForState $bothState $resumeEvent $null).Plan
-    Assert-Equal $secondaryReset $bothPlan.blockingResetAt 'multiple blocking windows choose latest reset'
-    Assert-Equal 'primary secondary' ($bothPlan.blockingWindows -join ' ') 'all blocking windows recorded'
+    Assert-Equal $primaryReset $bothPlan.blockingResetAt 'short window drives recovery reset'
+    Assert-Equal 'primary' ($bothPlan.blockingWindows -join ' ') 'weekly window remains independent'
+    Assert-Equal 'finalize_only' $bothPlan.resumeMode 'weekly finalization changes recovery mode'
 
     $missingState = Convert-UsageToState (New-UsageResponse 95 20 $null ($nowUnix + 50000)) (New-DefaultState)
     $missingPlan = (Get-ResumePlanForState $missingState $resumeEvent $null).Plan

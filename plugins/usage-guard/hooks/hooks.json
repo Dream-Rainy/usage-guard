@@ -47,7 +47,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(mcp__codex_app__get_usage_limits|mcp__codex_app__automation_update)$",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",

@@ -32,7 +32,7 @@ function New-Event {
 $nowUnix = [DateTimeOffset]::Parse($env:USAGE_GUARD_NOW_UTC).ToUnixTimeSeconds()
 $exactReset = $nowUnix + $script:ResumeMaxWaitSeconds - $script:ResumeSafetySeconds
 $state = Convert-UsageToState (New-UsageResponse 89 58) (New-DefaultState)
-$resumeState = Convert-UsageToState (New-UsageResponse 95 94 ($nowUnix + 1000) ($nowUnix + 2000)) (New-DefaultState)
+$resumeState = Convert-UsageToState (New-UsageResponse 95 20 ($nowUnix + 1000) ($nowUnix + 50000)) (New-DefaultState)
 $resume = Get-ResumePlanForState $resumeState (New-Event '') $null
 
 $snapshot = [ordered]@{
@@ -65,4 +65,3 @@ $snapshot = [ordered]@{
 }
 
 $snapshot | ConvertTo-Json -Depth 20 -Compress
-

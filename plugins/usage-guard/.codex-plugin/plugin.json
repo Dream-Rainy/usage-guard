@@ -1,6 +1,6 @@
 {
   "name": "usage-guard",
-  "version": "0.1.0+codex.20260911090000",
+  "version": "0.1.0+codex.20260911185903",
   "description": "Quota-aware lifecycle guardrails for long Codex tasks",
   "author": {
     "name": "Dream-Rainy"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Usage Guard",
     "shortDescription": "Check usage and protect long-running Codex work.",
-    "longDescription": "Usage Guard checks Codex usage before every tool call, narrows expensive work as limits approach, and preserves bounded checkpoints with one-shot recovery heartbeats for eligible pauses.",
+    "longDescription": "Usage Guard checks Codex usage before every tool call, separates short and weekly quota policy, verifies bounded checkpoints, and uses one-shot recovery heartbeats only for eligible short-window pauses.",
     "developerName": "Dream-Rainy",
     "category": "Productivity",
     "capabilities": [
