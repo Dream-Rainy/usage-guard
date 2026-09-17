@@ -244,6 +244,8 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     );
     assert.match(resumeInput.rrule, /^RRULE:FREQ=DAILY;BYHOUR=\d{2};BYMINUTE=\d{2};BYSECOND=\d{2};COUNT=1$/);
     assert.match(resumeInput.prompt, new RegExp(exactPlanResult.plan.scheduleKey));
+    const utcWake = Date.parse('2026-09-03T12:34:56Z') / 1000;
+    assert.equal(g.resumeAutomationRrule(utcWake), 'RRULE:FREQ=DAILY;BYHOUR=12;BYMINUTE=34;BYSECOND=56;COUNT=1');
     assert.equal(g.resumeAutomationRrule(null), null);
 
     exactState.resumePlan = exactPlanResult.plan;

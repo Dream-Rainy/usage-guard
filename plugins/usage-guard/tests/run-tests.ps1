@@ -264,6 +264,8 @@ try {
     Assert-Equal 'ACTIVE' $resumeInput.status 'resume automation is active'
     Assert-True ($resumeInput.rrule -match '^RRULE:FREQ=DAILY;BYHOUR=\d{2};BYMINUTE=\d{2};BYSECOND=\d{2};COUNT=1$') 'resume automation has a future one-shot RRULE'
     Assert-True ($resumeInput.prompt.Contains([string]$exactPlanResult.Plan.scheduleKey, [StringComparison]::Ordinal)) 'resume prompt binds schedule key'
+    $utcWake = [DateTimeOffset]::Parse('2026-09-03T12:34:56Z').ToUnixTimeSeconds()
+    Assert-Equal 'RRULE:FREQ=DAILY;BYHOUR=12;BYMINUTE=34;BYSECOND=56;COUNT=1' (Get-ResumeAutomationRrule $utcWake) 'resume RRULE uses UTC'
     Assert-True ($null -eq (Get-ResumeAutomationRrule $null)) 'invalid wake time has no RRULE'
 
     $exactState.resumePlan = $exactPlanResult.Plan

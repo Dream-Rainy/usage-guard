@@ -430,8 +430,8 @@ function Get-ResumeAutomationRrule {
     param($WakeAt)
     $unix = ConvertTo-Number $WakeAt
     if ($null -eq $unix) { return $null }
-    try { $local = [DateTimeOffset]::FromUnixTimeSeconds([long]$unix).ToLocalTime() } catch { return $null }
-    return "RRULE:FREQ=DAILY;BYHOUR=$($local.Hour.ToString('00'));BYMINUTE=$($local.Minute.ToString('00'));BYSECOND=$($local.Second.ToString('00'));COUNT=1"
+    try { $utc = [DateTimeOffset]::FromUnixTimeSeconds([long]$unix).ToUniversalTime() } catch { return $null }
+    return "RRULE:FREQ=DAILY;BYHOUR=$($utc.Hour.ToString('00'));BYMINUTE=$($utc.Minute.ToString('00'));BYSECOND=$($utc.Second.ToString('00'));COUNT=1"
 }
 
 function Get-ResumeAutomationInput {

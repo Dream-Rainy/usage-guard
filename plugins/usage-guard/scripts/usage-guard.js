@@ -511,11 +511,13 @@ function resumePlanForState(state, event, previousPlan, pause = null, continuati
 function resumeAutomationRrule(wakeAt) {
   const unix = toNumber(wakeAt);
   if (unix === null) return null;
-  const parts = new Intl.DateTimeFormat(undefined, {
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
-  }).formatToParts(new Date(unix * 1000));
-  const values = Object.fromEntries(parts.filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
-  if (!values.hour || !values.minute || !values.second) return null;
+  const date = new Date(unix * 1000);
+  if (Number.isNaN(date.getTime())) return null;
+  const values = {
+    hour: String(date.getUTCHours()).padStart(2, '0'),
+    minute: String(date.getUTCMinutes()).padStart(2, '0'),
+    second: String(date.getUTCSeconds()).padStart(2, '0'),
+  };
   return `RRULE:FREQ=DAILY;BYHOUR=${values.hour};BYMINUTE=${values.minute};BYSECOND=${values.second};COUNT=1`;
 }
 
