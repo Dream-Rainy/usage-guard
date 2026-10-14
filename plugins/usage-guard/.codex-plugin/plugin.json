@@ -1,6 +1,6 @@
 {
   "name": "usage-guard",
-  "version": "0.1.0+codex.20260915144542",
+  "version": "0.1.1",
   "description": "Quota-aware lifecycle guardrails for long Codex tasks",
   "author": {
     "name": "Dream-Rainy"

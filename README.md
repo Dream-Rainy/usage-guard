@@ -6,6 +6,8 @@ Usage Guard is a cross-platform Codex plugin that checks Codex usage at lifecycl
 
 The runtime uses only Node.js built-in modules and supports Windows, macOS, and Linux. Node.js 18 or newer and the Codex CLI must be available on `PATH`.
 
+Hooks reuse successful usage snapshots for 15 seconds. An app-server query has a six-second limit; failed queries retain the existing five-minute fallback. Recovery RRULE times use the desktop host's local timezone, while checkpoint reset timestamps remain absolute Unix times.
+
 ## Policy model
 
 Usage Guard keeps the short (5-hour) and weekly (7-day) windows independent:
@@ -29,6 +31,8 @@ Start a new Codex task after installation and review the lifecycle hooks when Co
 codex plugin marketplace upgrade usage-guard
 codex plugin add usage-guard@usage-guard
 ```
+
+Changing a development checkout does not update an installed plugin cache. Reinstall the new plugin version from its configured marketplace, then start a new task to load it.
 
 ## Local verification
 

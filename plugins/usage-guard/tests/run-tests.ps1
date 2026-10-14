@@ -265,7 +265,9 @@ try {
     Assert-True ($resumeInput.rrule -match '^RRULE:FREQ=DAILY;BYHOUR=\d{2};BYMINUTE=\d{2};BYSECOND=\d{2};COUNT=1$') 'resume automation has a future one-shot RRULE'
     Assert-True ($resumeInput.prompt.Contains([string]$exactPlanResult.Plan.scheduleKey, [StringComparison]::Ordinal)) 'resume prompt binds schedule key'
     $utcWake = [DateTimeOffset]::Parse('2026-09-03T12:34:56Z').ToUnixTimeSeconds()
-    Assert-Equal 'RRULE:FREQ=DAILY;BYHOUR=12;BYMINUTE=34;BYSECOND=56;COUNT=1' (Get-ResumeAutomationRrule $utcWake) 'resume RRULE uses UTC'
+    $expectedLocal = [TimeZoneInfo]::ConvertTime([DateTimeOffset]::FromUnixTimeSeconds($utcWake), [TimeZoneInfo]::Local)
+    $expectedRrule = 'RRULE:FREQ=DAILY;BYHOUR={0:00};BYMINUTE={1:00};BYSECOND={2:00};COUNT=1' -f $expectedLocal.Hour, $expectedLocal.Minute, $expectedLocal.Second
+    Assert-Equal $expectedRrule (Get-ResumeAutomationRrule $utcWake) 'resume RRULE uses the desktop host local timezone'
     Assert-True ($null -eq (Get-ResumeAutomationRrule $null)) 'invalid wake time has no RRULE'
 
     $exactState.resumePlan = $exactPlanResult.Plan
@@ -291,6 +293,7 @@ try {
     Assert-Equal 'deny' $unrelatedPre.hookSpecificOutput.permissionDecision 'unrelated automation denied in emergency'
 
     $successPost = New-Event 'PostToolUse' $script:AutomationToolName
+    $successPost.tool_input = [pscustomobject]$resumeInput
     $successPost.tool_response = [pscustomobject]@{
         isError = $false
         content = @([pscustomobject]@{ type = 'text'; text = '{"status":"created","id":"automation-123"}' })
@@ -300,9 +303,25 @@ try {
     Assert-Equal 'SCHEDULED' $scheduledState.resumePlan.status 'successful automation recorded as scheduled'
     Assert-Equal 'automation-123' $scheduledState.resumePlan.automationId 'automation id persisted'
 
+    $heartbeatPlan = $exactPlanResult.Plan | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+    $heartbeatPlan.status = 'SCHEDULED'
+    $heartbeatPlan.eligible = $true
+    $heartbeatPlan.wakeAt = $nowUnix - 1
+    $heartbeatState = Convert-UsageToState (New-UsageResponse 10 20 ($nowUnix - 181) ($nowUnix + 50000)) (New-DefaultState)
+    $heartbeatState.resumePlan = $heartbeatPlan
+    Write-JsonAtomic (Get-StatePath) $heartbeatState
+    Set-MockUsage 10 20 ($nowUnix - 181) ($nowUnix + 50000)
+    $heartbeatEvent = New-Event 'PostToolUse' $script:UsageToolName
+    $heartbeatEvent.turn_id = 'heartbeat-turn'
+    $heartbeatEvent.tool_response = New-UsageResponse 10 20 ($nowUnix - 181) ($nowUnix + 50000)
+    $heartbeatContext = Invoke-HookEvent $heartbeatEvent
+    Assert-True ($heartbeatContext.hookSpecificOutput.additionalContext -notmatch '(?i)manual resume|SKIPPED_INVALID_RESET') 'heartbeat consumes scheduled recovery after reset'
+    Assert-Equal 'CONSUMED' (Get-State).resumePlan.status 'heartbeat marks recovery plan consumed'
+
     $exactState.resumePlan = $exactPlanResult.Plan
     Write-JsonAtomic (Get-StatePath) $exactState
     $failedPost = New-Event 'PostToolUse' $script:AutomationToolName
+    $failedPost.tool_input = [pscustomobject]$resumeInput
     $failedPost.tool_response = [pscustomobject]@{ isError = $true; content = @() }
     $null = Invoke-AutomationPostTool $failedPost
     Assert-Equal 'FAILED' (Get-State).resumePlan.status 'failed automation recorded without retry loop'
@@ -310,12 +329,14 @@ try {
     $exactState.resumePlan = $exactPlanResult.Plan
     Write-JsonAtomic (Get-StatePath) $exactState
     $genericIdPost = New-Event 'PostToolUse' $script:AutomationToolName
+    $genericIdPost.turn_id = 'generic-id-post-turn'
+    $genericIdPost.tool_input = [pscustomobject]@{ name = 'Other task'; prompt = 'Unrelated automation' }
     $genericIdPost.tool_response = [pscustomobject]@{
         isError = $false
         content = @([pscustomobject]@{ type = 'text'; text = '{"id":"request-only"}' })
     }
     $null = Invoke-AutomationPostTool $genericIdPost
-    Assert-Equal 'FAILED' (Get-State).resumePlan.status 'generic response id is not treated as scheduling success'
+    Assert-Equal 'REQUESTED' (Get-State).resumePlan.status 'generic automation update does not mutate recovery plan'
 
     $expiredState = $exactState | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
     $expiredPlan = $exactPlanResult.Plan | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40

@@ -8,9 +8,9 @@ const { randomUUID, createHash } = require('node:crypto');
 
 const USAGE_TOOL_NAME = 'mcp__codex_app__get_usage_limits';
 const AUTOMATION_TOOL_NAME = 'mcp__codex_app__automation_update';
-const FRESH_SECONDS = 120;
+const FRESH_SECONDS = 15;
 const STALE_SECONDS = 300;
-const QUERY_TIMEOUT_SECONDS = 10;
+const QUERY_TIMEOUT_SECONDS = 6;
 const RESUME_SAFETY_SECONDS = 180;
 const RESUME_MAX_WAIT_SECONDS = 21600;
 const LOCK_STALE_MS = 30_000;
@@ -71,7 +71,7 @@ function acquireLock(filePath) {
   const lockPath = `${filePath}.lock`;
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   let lastError;
-  for (const delay of [0, 10, 25, 50, 100, 200, 400, 800, 1200]) {
+  for (const delay of [0, 10, 25, 50, 100, 200]) {
     if (delay) sleepSync(delay);
     try {
       const handle = fs.openSync(lockPath, 'wx');
@@ -170,6 +170,36 @@ function saveContinuationRecord(event, record) {
 
 function activePlan(plan) {
   return Boolean(getValue(plan, 'eligible')) && ['REQUESTED', 'SCHEDULED', 'FAILED'].includes(String(getValue(plan, 'status') ?? ''));
+}
+
+function consumeResumePlan(record, plan) {
+  record.taskStatus = 'RUNNING';
+  record.continuationEnabled = true;
+  record.pauseReason = null;
+  record.resumePlan = { ...plan, eligible: false, status: 'CONSUMED', consumedAt: isoNow(), updatedAt: isoNow() };
+  return record.resumePlan;
+}
+
+function shouldConsumeRecoveredPlan(state, continuation, plan) {
+  if (String(getValue(continuation, 'taskStatus') ?? '') !== 'PAUSED_QUOTA') return false;
+  if (String(getValue(continuation, 'pauseReason') ?? '') === 'weekly_budget') return false;
+  if (!Boolean(getValue(plan, 'eligible')) || String(getValue(plan, 'status') ?? '') !== 'SCHEDULED') return false;
+  if (!String(getValue(plan, 'scheduleKey') ?? '').trim()) return false;
+  const wakeAt = toNumber(getValue(plan, 'wakeAt'));
+  const nowUnix = Math.floor(utcNow().getTime() / 1000);
+  if (wakeAt === null || wakeAt > nowUnix) return false;
+  return ['RUN', 'SHORT_CONSERVE', 'WEEKLY_LOW'].includes(String(getValue(state, 'policyAction') ?? ''));
+}
+
+function consumeRecoveredPlan(state, continuation, plan, turn) {
+  if (!shouldConsumeRecoveredPlan(state, continuation, plan)) return plan;
+  const scheduleKey = String(getValue(plan, 'scheduleKey'));
+  consumeResumePlan(continuation, plan);
+  if (turn) {
+    turn.resumeScheduleAttempted = true;
+    turn.resumeScheduleKey = scheduleKey;
+  }
+  return continuationPlan(continuation);
 }
 
 function terminalTaskStatus(status) {
@@ -513,10 +543,11 @@ function resumeAutomationRrule(wakeAt) {
   if (unix === null) return null;
   const date = new Date(unix * 1000);
   if (Number.isNaN(date.getTime())) return null;
+  // A floating RRULE is interpreted in the desktop host's local timezone.
   const values = {
-    hour: String(date.getUTCHours()).padStart(2, '0'),
-    minute: String(date.getUTCMinutes()).padStart(2, '0'),
-    second: String(date.getUTCSeconds()).padStart(2, '0'),
+    hour: String(date.getHours()).padStart(2, '0'),
+    minute: String(date.getMinutes()).padStart(2, '0'),
+    second: String(date.getSeconds()).padStart(2, '0'),
   };
   return `RRULE:FREQ=DAILY;BYHOUR=${values.hour};BYMINUTE=${values.minute};BYSECOND=${values.second};COUNT=1`;
 }
@@ -569,16 +600,22 @@ function rateLimitQuery() {
     let settled = false;
     let stdout = '';
     let stderr = '';
+    let phase = 'initialize';
+    const send = request => child.stdin.write(`${JSON.stringify(request)}\n`);
     const finish = (error, result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try { child.stdin.end(); } catch { /* best effort */ }
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
       if (!child.killed) child.kill();
+      child.unref();
       error ? reject(error) : resolve(result);
     };
-    const timer = setTimeout(() => finish(new Error('Timed out waiting for account/rateLimits/read.')), QUERY_TIMEOUT_SECONDS * 1000);
+    const timer = setTimeout(() => finish(new Error(`Timed out waiting for app-server ${phase} response.`)), QUERY_TIMEOUT_SECONDS * 1000);
     child.on('error', (error) => finish(new Error(`codex app-server is unavailable: ${error.message}`)));
+    child.stdin.on('error', error => finish(new Error(`codex app-server input failed: ${error.message}`)));
     child.stderr.on('data', chunk => { stderr += chunk.toString('utf8'); });
     child.stdout.on('data', chunk => {
       stdout += chunk.toString('utf8');
@@ -588,7 +625,17 @@ function rateLimitQuery() {
         if (!line.trim()) continue;
         let message;
         try { message = JSON.parse(line); } catch { continue; }
-        if (getValue(message, 'id') !== 2) continue;
+        const id = getValue(message, 'id');
+        if (id === 1) {
+          const error = getValue(message, 'error');
+          if (error !== null) return finish(new Error(`codex app-server initialize failed: ${JSON.stringify(error)}`));
+          if (getValue(message, 'result') === null) return finish(new Error('codex app-server initialize returned no result.'));
+          phase = 'account/rateLimits/read';
+          send({ method: 'initialized' });
+          send({ id: 2, method: 'account/rateLimits/read', params: null });
+          continue;
+        }
+        if (id !== 2) continue;
         const error = getValue(message, 'error');
         if (error !== null) return finish(new Error(`account/rateLimits/read failed: ${JSON.stringify(error)}`));
         const result = getValue(message, 'result');
@@ -599,11 +646,7 @@ function rateLimitQuery() {
     child.on('exit', code => {
       if (!settled) finish(new Error(`codex app-server exited before returning usage (code=${code}; stderr=${boundedErrorText(stderr)}).`));
     });
-    for (const request of [
-      { id: 1, method: 'initialize', params: { clientInfo: { name: 'usage-guard', version: '0.1.0' }, capabilities: { experimentalApi: true } } },
-      { method: 'initialized' },
-      { id: 2, method: 'account/rateLimits/read', params: null },
-    ]) child.stdin.write(`${JSON.stringify(request)}\n`);
+    send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'usage-guard', version: '0.1.1' }, capabilities: { experimentalApi: true } } });
   });
 }
 
@@ -746,10 +789,7 @@ function beginUserPrompt(event) {
   const key = recoveryScheduleKey(getValue(event, 'prompt'));
   const plan = continuationPlan(record);
   if (key && activePlan(plan) && key === String(getValue(plan, 'scheduleKey') ?? '')) {
-    record.taskStatus = 'RUNNING';
-    record.continuationEnabled = true;
-    record.pauseReason = null;
-    record.resumePlan = { ...plan, eligible: false, status: 'CONSUMED', consumedAt: isoNow(), updatedAt: isoNow() };
+    consumeResumePlan(record, plan);
     saveContinuationRecord(event, record);
     return record;
   }
@@ -820,8 +860,10 @@ async function updateUsageSnapshot(event, turn = null) {
   const continuation = getContinuationRecord(event);
   turn.usageAttempted = true;
   try {
-    const previousPlan = continuationPlan(continuation);
-    state = usageToState(await rateLimitQuery(), state);
+    let previousPlan = continuationPlan(continuation);
+    const snapshotAge = snapshotAgeSeconds(state);
+    if (snapshotAge < 0 || snapshotAge >= FRESH_SECONDS) state = usageToState(await rateLimitQuery(), state);
+    previousPlan = consumeRecoveredPlan(state, continuation, previousPlan, turn);
     const classification = toolClassification(event);
     const pause = continuation.taskStatus === 'PAUSED_QUOTA'
       ? continuation
@@ -980,9 +1022,10 @@ function usagePostTool(event) {
   try {
     const previousPlan = continuationPlan(continuation);
     state = usageToState(getValue(event, 'tool_response'), state);
+    const recoveredPlan = consumeRecoveredPlan(state, continuation, previousPlan, turn);
     const resume = continuation.taskStatus === 'PAUSED_QUOTA'
-      ? resumePlanForState(state, event, previousPlan, continuation, continuation)
-      : { plan: previousPlan, requestCreated: false };
+      ? resumePlanForState(state, event, recoveredPlan, continuation, continuation)
+      : { plan: recoveredPlan, requestCreated: false };
     state.resumePlan = resume.plan;
     continuation.resumePlan = resume.plan;
     turn.usageChecked = true;
@@ -1040,9 +1083,15 @@ function boundedErrorText(value) {
 function automationPostTool(event) {
   const state = getState();
   const continuation = getContinuationRecord(event);
-  const turn = getTurnRecord(event) ?? newTurnRecord(event);
-  turn.resumeScheduleAttempted = true;
   const plan = continuationPlan(continuation);
+  const turn = getTurnRecord(event);
+  const attempted = activePlan(plan) && Boolean(turn && getValue(turn, 'resumeScheduleAttempted'))
+    && String(getValue(turn, 'resumeScheduleKey') ?? '') === String(getValue(plan, 'scheduleKey') ?? '');
+  const matched = matchingResumeAutomation(event, state, plan);
+  const hasInput = getValue(event, 'tool_input') !== null;
+  if ((hasInput && !matched) || (!hasInput && !attempted)) return {};
+  const trackedTurn = turn ?? newTurnRecord(event);
+  trackedTurn.resumeScheduleAttempted = true;
   try {
     const response = getValue(event, 'tool_response');
     if (getValue(response, 'isError') === true) throw new Error('Automation tool reported an error.');
@@ -1059,7 +1108,7 @@ function automationPostTool(event) {
     state.resumePlan = plan;
     writeJsonAtomic(statePath(), state);
     saveContinuationRecord(event, continuation);
-    saveTurnRecord(event, turn);
+    saveTurnRecord(event, trackedTurn);
     return contextOutput('PostToolUse', `Usage Guard auto-resume scheduled for scheduleKey=${String(getValue(plan, 'scheduleKey') ?? '')}. Do not create another heartbeat.`);
   } catch (error) {
     plan.status = 'FAILED';
@@ -1072,7 +1121,7 @@ function automationPostTool(event) {
     state.resumePlan = plan;
     writeJsonAtomic(statePath(), state);
     saveContinuationRecord(event, continuation);
-    saveTurnRecord(event, turn);
+    saveTurnRecord(event, trackedTurn);
     return contextOutput('PostToolUse', 'Usage Guard auto-resume scheduling failed. Preserve a bounded checkpoint and use manual resume; do not retry automatically.', 'Usage Guard could not schedule auto-resume.');
   }
 }

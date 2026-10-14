@@ -372,6 +372,27 @@ function Test-ActiveResumePlan {
     return [bool](Get-Value $Plan 'eligible') -and [string](Get-Value $Plan 'status') -in @('REQUESTED', 'SCHEDULED', 'FAILED')
 }
 
+function Test-RecoveredResumePlan {
+    param($State, $Plan)
+    if (-not (Test-ActiveResumePlan $Plan) -or [string](Get-Value $Plan 'status') -ne 'SCHEDULED') { return $false }
+    if ([string]::IsNullOrWhiteSpace([string](Get-Value $Plan 'scheduleKey'))) { return $false }
+    if ([string](Get-Value $State 'policyAction') -notin @('RUN', 'SHORT_CONSERVE', 'WEEKLY_LOW')) { return $false }
+    $wakeAt = ConvertTo-Number (Get-Value $Plan 'wakeAt')
+    if ($null -eq $wakeAt) { return $false }
+    return [long][Math]::Floor($wakeAt) -le [long](Get-UtcNow).ToUnixTimeSeconds()
+}
+
+function Consume-RecoveredResumePlan {
+    param($Plan)
+    $Plan.eligible = $false
+    $Plan.status = 'CONSUMED'
+    $consumedAt = (Get-UtcNow).ToString('o')
+    if ($Plan -is [System.Collections.IDictionary]) { $Plan['consumedAt'] = $consumedAt }
+    else { $Plan | Add-Member -MemberType NoteProperty -Name consumedAt -Value $consumedAt -Force }
+    $Plan.updatedAt = (Get-UtcNow).ToString('o')
+    return $Plan
+}
+
 function Get-ResumePlanForState {
     param($State, $Event, $PreviousPlan, $Pause = $null, $Continuation = $null)
     $previous = if ($null -ne $PreviousPlan) { $PreviousPlan } else { New-ResumePlan }
@@ -430,8 +451,8 @@ function Get-ResumeAutomationRrule {
     param($WakeAt)
     $unix = ConvertTo-Number $WakeAt
     if ($null -eq $unix) { return $null }
-    try { $utc = [DateTimeOffset]::FromUnixTimeSeconds([long]$unix).ToUniversalTime() } catch { return $null }
-    return "RRULE:FREQ=DAILY;BYHOUR=$($utc.Hour.ToString('00'));BYMINUTE=$($utc.Minute.ToString('00'));BYSECOND=$($utc.Second.ToString('00'));COUNT=1"
+    try { $local = [DateTimeOffset]::FromUnixTimeSeconds([long]$unix).ToLocalTime() } catch { return $null }
+    return "RRULE:FREQ=DAILY;BYHOUR=$($local.Hour.ToString('00'));BYMINUTE=$($local.Minute.ToString('00'));BYSECOND=$($local.Second.ToString('00'));COUNT=1"
 }
 
 function Get-ResumeAutomationInput {
@@ -767,9 +788,14 @@ function Update-UsageSnapshot {
     try {
         $previousPlan = Get-Value $state 'resumePlan'
         $state = Convert-UsageToState (Invoke-RateLimitQuery) $state
-        $classification = Get-ToolClassification $Event
-        $pause = if ($Turn.pauseCandidate -and $Turn.checkpointObserved) { $Turn } else { $null }
-        $resume = if ($null -ne $pause -or $classification.Kind -eq 'resume-automation') { Get-ResumePlanForState $state $Event $previousPlan $pause } else { [pscustomobject]@{ Plan = $previousPlan; RequestCreated = $false } }
+        if (Test-RecoveredResumePlan $state $previousPlan) {
+            $resume = [pscustomobject]@{ Plan = Consume-RecoveredResumePlan $previousPlan; RequestCreated = $false }
+        }
+        else {
+            $classification = Get-ToolClassification $Event
+            $pause = if ($Turn.pauseCandidate -and $Turn.checkpointObserved) { $Turn } else { $null }
+            $resume = if ($null -ne $pause -or $classification.Kind -eq 'resume-automation') { Get-ResumePlanForState $state $Event $previousPlan $pause } else { [pscustomobject]@{ Plan = $previousPlan; RequestCreated = $false } }
+        }
         $state.resumePlan = $resume.Plan
         $Turn.usageChecked = $true
         $Turn.effectivePolicy = $state.currentPolicy
@@ -936,7 +962,12 @@ function Invoke-UsagePostTool {
         }
         $previousPlan = Get-Value $state 'resumePlan'
         $state = Convert-UsageToState $toolResponse $state
-        $resume = Get-ResumePlanForState $state $Event $previousPlan
+        if (Test-RecoveredResumePlan $state $previousPlan) {
+            $resume = [pscustomobject]@{ Plan = Consume-RecoveredResumePlan $previousPlan; RequestCreated = $false }
+        }
+        else {
+            $resume = Get-ResumePlanForState $state $Event $previousPlan
+        }
         $state.resumePlan = $resume.Plan
         $turn.usageChecked = $true
         $turn.effectivePolicy = $state.currentPolicy
@@ -1005,9 +1036,14 @@ function Invoke-AutomationPostTool {
     $state = Get-State
     $turn = Get-TurnRecord $Event
     if ($null -eq $turn) { $turn = New-TurnRecord $Event }
-    $turn.resumeScheduleAttempted = $true
     $plan = Get-Value $state 'resumePlan'
     if ($null -eq $plan) { $plan = New-ResumePlan }
+    $attempted = (Test-ActiveResumePlan $plan) -and [bool](Get-Value $turn 'resumeScheduleAttempted') -and
+        ([string](Get-Value $turn 'resumeScheduleKey') -eq [string](Get-Value $plan 'scheduleKey'))
+    $matched = Test-MatchingResumeAutomation $Event $state $plan
+    $hasInput = $null -ne (Get-Value $Event 'tool_input')
+    if (($hasInput -and -not $matched) -or (-not $hasInput -and -not $attempted)) { return @{} }
+    $turn.resumeScheduleAttempted = $true
     try {
         $response = Get-Value $Event 'tool_response'
         if ((Get-Value $response 'isError') -eq $true) { throw 'Automation tool reported an error.' }

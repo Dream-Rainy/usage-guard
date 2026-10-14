@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 
 const handlerPath = path.resolve(__dirname, '..', 'scripts', 'usage-guard.js');
@@ -176,6 +176,7 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     const pauseNow = Date.parse(process.env.USAGE_GUARD_NOW_UTC) / 1000;
     const pauseReset = pauseNow + 1800;
     setMockUsage(86, 20, pauseReset, pauseNow + 50000);
+    process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:07:16Z';
     const checkpointRoot = path.join(testRoot, 'checkpoint-workspace');
     fs.mkdirSync(path.join(checkpointRoot, 'docs', 'plan'), { recursive: true });
     fs.writeFileSync(path.join(checkpointRoot, 'docs', 'plan', 'progress.md'), 'bounded checkpoint\n', 'utf8');
@@ -245,7 +246,13 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     assert.match(resumeInput.rrule, /^RRULE:FREQ=DAILY;BYHOUR=\d{2};BYMINUTE=\d{2};BYSECOND=\d{2};COUNT=1$/);
     assert.match(resumeInput.prompt, new RegExp(exactPlanResult.plan.scheduleKey));
     const utcWake = Date.parse('2026-09-03T12:34:56Z') / 1000;
-    assert.equal(g.resumeAutomationRrule(utcWake), 'RRULE:FREQ=DAILY;BYHOUR=12;BYMINUTE=34;BYSECOND=56;COUNT=1');
+    for (const [timezone, time] of [['Asia/Singapore', '20;BYMINUTE=34'], ['America/New_York', '08;BYMINUTE=34'], ['Asia/Kathmandu', '18;BYMINUTE=19']]) {
+      const result = spawnSync(process.execPath, ['-e', `process.stdout.write(require(${JSON.stringify(handlerPath)}).resumeAutomationRrule(${utcWake}));`], {
+        env: { ...process.env, TZ: timezone }, encoding: 'utf8', timeout: 3000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, `RRULE:FREQ=DAILY;BYHOUR=${time};BYSECOND=56;COUNT=1`, timezone);
+    }
     assert.equal(g.resumeAutomationRrule(null), null);
 
     exactState.resumePlan = exactPlanResult.plan;
@@ -284,6 +291,7 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     const successPost = event('PostToolUse', g.constants.AUTOMATION_TOOL_NAME);
     successPost.session_id = resumeEvent.session_id;
     successPost.cwd = checkpointRoot;
+    successPost.tool_input = resumeInput;
     successPost.tool_response = { isError: false, content: [{ type: 'text', text: '{"status":"created","id":"automation-123"}' }] };
     g.automationPostTool(successPost);
     assert.equal(g.getState().resumePlan.status, 'SCHEDULED');
@@ -298,10 +306,33 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     const consumed = g.getContinuationRecord(recoveryPrompt);
     assert.equal(consumed.taskStatus, 'RUNNING');
     assert.equal(consumed.resumePlan.status, 'CONSUMED');
+
+    const heartbeatEvent = event('PostToolUse', g.constants.USAGE_TOOL_NAME);
+    heartbeatEvent.session_id = 'heartbeat-session';
+    heartbeatEvent.turn_id = 'heartbeat-turn';
+    heartbeatEvent.cwd = checkpointRoot;
+    const heartbeatPlan = { ...exactPlanResult.plan, eligible: true, status: 'SCHEDULED', wakeAt: nowUnix - 1 };
+    const heartbeatContinuation = g.newContinuationRecord(heartbeatEvent);
+    heartbeatContinuation.taskStatus = 'PAUSED_QUOTA';
+    heartbeatContinuation.pauseReason = 'short_window';
+    heartbeatContinuation.pauseWindow = 'primary';
+    heartbeatContinuation.pauseResetAt = nowUnix - 181;
+    heartbeatContinuation.resumePlan = heartbeatPlan;
+    g.saveContinuationRecord(heartbeatEvent, heartbeatContinuation);
+    const heartbeatState = g.usageToState(usageResponse(10, 20, nowUnix - 181, nowUnix + 50000), g.newDefaultState());
+    heartbeatState.resumePlan = heartbeatPlan;
+    g.writeJsonAtomic(g.statePath(), heartbeatState);
+    heartbeatEvent.tool_response = usageResponse(10, 20, nowUnix - 181, nowUnix + 50000);
+    const heartbeatContext = await g.invokeHookEvent(heartbeatEvent);
+    assert.doesNotMatch(heartbeatContext.hookSpecificOutput.additionalContext, /manual resume|SKIPPED_INVALID_RESET/i);
+    assert.equal(g.getContinuationRecord(heartbeatEvent).taskStatus, 'RUNNING');
+    assert.equal(g.getState().resumePlan.status, 'CONSUMED');
+
     const cycleEvent = event('PreToolUse', 'exec', 'text(await tools.apply_patch("*** Update File: docs/plan/progress.md"))');
     cycleEvent.session_id = resumeEvent.session_id;
     cycleEvent.turn_id = 'cycle-two';
     cycleEvent.cwd = checkpointRoot;
+    process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:00:16Z';
     setMockUsage(95, 20, nowUnix + 1800, nowUnix + 50000);
     await g.preToolPolicy(cycleEvent);
     g.writeJsonAtomic(g.checkpointMarkerPath(cycleEvent), {
@@ -323,6 +354,7 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     weeklyEvent.session_id = 'weekly-session';
     weeklyEvent.turn_id = 'weekly-turn';
     weeklyEvent.cwd = checkpointRoot;
+    process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:00:32Z';
     setMockUsage(10, 96, nowUnix + 50000, nowUnix + 70000);
     const weeklyContext = await g.preToolPolicy(weeklyEvent);
     assert.match(weeklyContext.hookSpecificOutput.additionalContext, /WEEKLY_STOP/);
@@ -344,6 +376,10 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     const failedPost = event('PostToolUse', g.constants.AUTOMATION_TOOL_NAME);
     failedPost.session_id = resumeEvent.session_id;
     failedPost.cwd = checkpointRoot;
+    const failedContinuation = g.newContinuationRecord(failedPost);
+    failedContinuation.resumePlan = exactPlanResult.plan;
+    g.saveContinuationRecord(failedPost, failedContinuation);
+    failedPost.tool_input = resumeInput;
     failedPost.tool_response = { isError: true };
     g.automationPostTool(failedPost);
     assert.equal(g.getState().resumePlan.status, 'FAILED');
@@ -351,10 +387,12 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     g.writeJsonAtomic(g.statePath(), exactState);
     const genericPost = event('PostToolUse', g.constants.AUTOMATION_TOOL_NAME);
     genericPost.session_id = resumeEvent.session_id;
+    genericPost.turn_id = 'generic-post-turn';
     genericPost.cwd = checkpointRoot;
+    genericPost.tool_input = { name: 'Other task', prompt: 'Unrelated automation' };
     genericPost.tool_response = { isError: false, content: [{ type: 'text', text: '{"id":"generic"}' }] };
     g.automationPostTool(genericPost);
-    assert.equal(g.getState().resumePlan.status, 'FAILED');
+    assert.equal(g.getState().resumePlan.status, 'REQUESTED');
 
     const expiredState = structuredClone(exactState);
     expiredState.resumePlan = structuredClone(exactPlanResult.plan);
@@ -441,6 +479,7 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     const malformedResult = await runHandler('{bad json', { PLUGIN_DATA: processRoot });
     assert.match(JSON.parse(malformedResult.stdout).systemMessage, /failed safely/);
 
+    process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:00:00Z';
     const baselineEvent = event('PreToolUse');
     baselineEvent.session_id = 'equivalence-session';
     baselineEvent.turn_id = 'equivalence-turn';
@@ -475,9 +514,74 @@ test('Usage Guard JavaScript handler preserves policy and hook behavior', async 
     if (process.platform === 'win32') {
       assert.deepEqual(jsSnapshot, await runPowerShellBaseline());
     }
+
+    const cacheRoot = path.join(testRoot, 'snapshot-cache');
+    process.env.PLUGIN_DATA = cacheRoot;
+    process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:00:00Z';
+    setMockUsage(10, 20);
+    const firstSnapshot = await g.updateUsageSnapshot(event('UserPromptSubmit'));
+    const firstTimestamp = firstSnapshot.state.lastSuccessfulAt;
+    assert.equal(firstSnapshot.state.evidence.primaryRemaining, 90);
+
+    setMockUsage(95, 20);
+    process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:00:14Z';
+    const cachedSnapshot = await g.updateUsageSnapshot(event('PreToolUse', 'Bash', 'git status --short'));
+    assert.equal(cachedSnapshot.state.evidence.primaryRemaining, 90);
+    assert.equal(cachedSnapshot.state.lastSuccessfulAt, firstTimestamp);
+
+    process.env.USAGE_GUARD_NOW_UTC = '2026-09-03T00:00:16Z';
+    const refreshedSnapshot = await g.updateUsageSnapshot(event('PreToolUse', 'Bash', 'git status --short'));
+    assert.equal(refreshedSnapshot.state.evidence.primaryRemaining, 5);
+    assert.notEqual(refreshedSnapshot.state.lastSuccessfulAt, firstTimestamp);
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in previousEnv)) delete process.env[key];
     for (const [key, value] of Object.entries(previousEnv)) process.env[key] = value;
+    fs.rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test('a stalled app-server completes the handshake and the hook exits before its 15s limit', async () => {
+  const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-guard-timeout-'));
+  const server = `
+    const rl = require('node:readline').createInterface({ input: process.stdin });
+    let ready = false, notified = false;
+    rl.on('line', line => {
+      const message = JSON.parse(line);
+      if (message.method === 'initialize') setTimeout(() => {
+        ready = true;
+        process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + '\\n');
+      }, 50);
+      else if (message.method === 'initialized') {
+        if (!ready) process.exit(2);
+        notified = true;
+      } else if (message.method === 'account/rateLimits/read' && (!ready || !notified)) process.exit(3);
+    });
+    setInterval(() => {}, 1000);
+  `;
+  const code = `
+    const cp = require('node:child_process'), spawn = cp.spawn;
+    cp.spawn = (command, args, options) => command === 'codex'
+      ? spawn(process.execPath, ['-e', ${JSON.stringify(server)}], options)
+      : spawn(command, args, options);
+    require(${JSON.stringify(handlerPath)}).main();
+  `;
+  const env = { ...process.env, PLUGIN_DATA: testRoot };
+  delete env.USAGE_GUARD_TEST_RESPONSE_PATH;
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['-e', code], { env, stdio: 'pipe', windowsHide: true });
+      let stdout = '', stderr = '';
+      const deadline = setTimeout(() => { child.kill(); reject(new Error('The hook did not exit within 14 seconds.')); }, 14_000);
+      child.stdout.on('data', data => { stdout += data; });
+      child.stderr.on('data', data => { stderr += data; });
+      child.on('error', error => { clearTimeout(deadline); reject(error); });
+      child.on('close', exitCode => { clearTimeout(deadline); resolve({ stdout, stderr, exitCode }); });
+      child.stdin.end(JSON.stringify(event('UserPromptSubmit')));
+    });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stderr, /Timed out waiting for app-server account\/rateLimits\/read response/);
+    assert.match(JSON.parse(result.stdout).hookSpecificOutput.additionalContext, /query failed; fail-open/);
+  } finally {
     fs.rmSync(testRoot, { recursive: true, force: true });
   }
 });
